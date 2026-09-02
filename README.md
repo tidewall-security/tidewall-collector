@@ -9,12 +9,15 @@ from the machines where it happens.
 
 ## The problem
 
-Tidewall inspects AI traffic that is routed through it. It has no view of
-activity on a host that never was — a developer running a coding agent locally,
-outside any guarded path.
+Tidewall inspects AI traffic that is routed through it. It has no view of what
+runs on a host that never routed anything to it.
 
-This collector is meant to see that activity: which AI coding tools are running
-on an endpoint, and how much. It is a posture signal, not a detection one.
+This collector reports **which AI coding tools are running on an endpoint, and
+how much**. It is a posture signal, not a detection one.
+
+**It does not report whether that activity was guarded.** Answering that needs a
+correlation key that does not currently exist, so this reports what is running —
+not what escaped.
 
 ## What it will collect
 
