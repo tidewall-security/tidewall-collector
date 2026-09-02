@@ -28,21 +28,28 @@ not what escaped.
 Session activity from AI coding agents, read directly from wherever each stores
 it — JSONL files, JSON trees, or SQLite databases.
 
-**Claude Code is the first target and the reference implementation.** The others
-follow: Codex CLI, Claude Desktop, Cursor, Warp, opencode, Cline.
+**Claude Code is the first target and the reference implementation.** Codex CLI,
+Claude Desktop and Cline follow.
+
+Cursor, Warp and opencode store sessions in SQLite, and whether they can be read
+safely while those applications hold the databases open is unverified. They are
+targets, not commitments.
 
 Nothing here is implemented yet, so this is a target list rather than a support
 matrix. A platform is listed as supported in this README only once it is.
 
 ## What it will not collect
 
-**Prompt and response content never leaves the machine.**
+**Prompt and response content does not leave the machine by default.**
 
 The exported record carries metadata only — which tool, when, which model, how
 many turns.
 
-Content is not stripped out of the record. **A record containing it is never
-built.** The collector reads each session store, extracts the fields it needs and
+Content collection is a separate, explicit opt-in — off unless an operator turns
+it on, and gated behind its own access boundary when they do.
+
+In the default configuration, content is not stripped out of the record.
+**A record containing it is never built.** The collector reads each session store, extracts the fields it needs and
 constructs the export from those — so there is no filtering step to
 misconfigure, and no copy left behind in a field somebody forgot to clear.
 
@@ -50,8 +57,10 @@ This is a deliberate boundary. Reporting that a coding agent ran forty sessions
 on a host is asset posture. Collecting what was typed into it is not, and this
 component is not built to do it.
 
-It runs as a per-user agent, not a system service. It reads the files of the user
-running it, needs no elevated privileges, and that user can stop it.
+It supports two deployment modes, chosen at install: a **per-user agent** that
+reads only the files of the user running it and needs no elevated privileges, and
+a **system service** for organisations that require collection a user cannot
+disable.
 
 ## How it fits
 
