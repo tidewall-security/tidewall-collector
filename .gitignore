@@ -1,0 +1,17 @@
+# OpenTelemetry Collector Builder output
+/_build/
+/dist/
+otelcol-tidewall
+*.tar.gz
+*.deb
+*.rpm
+*.msi
+
+# Go
+/vendor/
+
+# Local collector state and config overrides
+*.local.yaml
+/storage/
+
+.DS_Store
