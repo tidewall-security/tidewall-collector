@@ -12,8 +12,12 @@ from the machines where it happens.
 Tidewall inspects AI traffic that is routed through it. It has no view of what
 runs on a host that never routed anything to it.
 
-This collector reports **which AI coding tools are running on an endpoint, and
-how much**. It is a posture signal, not a detection one.
+This collector reports **which AI coding tools have produced session activity on
+an endpoint, and how much**. It is a posture signal, not a detection one.
+
+"Produced session activity" is deliberate: the input is session logs on disk, so
+this shows recorded activity within a window. It does not show which tools are
+currently running, nor which are merely installed and unused.
 
 **It does not report whether that activity was guarded.** Answering that needs a
 correlation key that does not currently exist, so this reports what is running —
@@ -26,23 +30,27 @@ Session activity from agents that write append-only JSONL:
 | agent | source |
 |---|---|
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
-| OpenAI Codex CLI | `~/.codex/sessions/**/*.jsonl` |
+| OpenAI Codex CLI | `~/.codex/sessions/**/*.jsonl` — *pending: see below* |
 | Claude Desktop | local agent-mode session audit log |
 
-Agents that store sessions in SQLite — Cursor, Warp, opencode — are **not
-covered**, because the collector's SQL receiver has no SQLite driver. Supporting
-them needs additional work and is not part of the first release. This list is
-what the tool does, not a roadmap of what it aspires to.
+Codex CLI writes its session identifier only once per session, so attributing
+its later records is unresolved. It is listed because the source is readable, not
+because the problem is solved.
+
+Agents that store sessions in SQLite — Cursor, Warp, opencode — are **not covered
+in the first release**. Whether they can be is undetermined and depends on driver
+availability in the built distribution.
+
+This list is what the tool does, not a roadmap of what it aspires to.
 
 ## What it will not collect
 
 **Prompt and response content never leaves the machine.**
 
-The exported record is metadata about a session — which tool, when, how many
-turns, which model — and the log body is dropped before export. This is enforced
-by an allowlist rather than by pattern-matching sensitive strings: the set of
-exported fields is closed, so content cannot escape through a pattern nobody
-thought to write.
+The exported record carries metadata only — which tool, when, which model — and
+the log body is cleared before export. This is enforced by an allowlist rather
+than by pattern-matching sensitive strings: the set of exported fields is closed,
+so content cannot escape through a pattern nobody thought to write.
 
 This is a deliberate boundary. Reporting that a coding agent ran forty sessions
 on a host is asset posture. Collecting what was typed into it is not, and this
