@@ -25,32 +25,26 @@ not what escaped.
 
 ## What it will collect
 
-Session activity from agents that write append-only JSONL:
+Session activity from AI coding agents, read directly from wherever each stores
+it — JSONL files, JSON trees, or SQLite databases.
 
-| agent | source |
-|---|---|
-| Claude Code | `~/.claude/projects/**/*.jsonl` |
-| OpenAI Codex CLI | `~/.codex/sessions/**/*.jsonl` — *pending: see below* |
-| Claude Desktop | local agent-mode session audit log |
+**Claude Code is the first target and the reference implementation.** The others
+follow: Codex CLI, Claude Desktop, Cursor, Warp, opencode, Cline.
 
-Codex CLI writes its session identifier only once per session, so attributing
-its later records is unresolved. It is listed because the source is readable, not
-because the problem is solved.
-
-Agents that store sessions in SQLite — Cursor, Warp, opencode — are **not covered
-in the first release**. Whether they can be is undetermined and depends on driver
-availability in the built distribution.
-
-This list is what the tool does, not a roadmap of what it aspires to.
+Nothing here is implemented yet, so this is a target list rather than a support
+matrix. A platform is listed as supported in this README only once it is.
 
 ## What it will not collect
 
 **Prompt and response content never leaves the machine.**
 
-The exported record carries metadata only — which tool, when, which model — and
-the log body is cleared before export. This is enforced by an allowlist rather
-than by pattern-matching sensitive strings: the set of exported fields is closed,
-so content cannot escape through a pattern nobody thought to write.
+The exported record carries metadata only — which tool, when, which model, how
+many turns.
+
+Content is not stripped out of the record. **A record containing it is never
+built.** The collector reads each session store, extracts the fields it needs and
+constructs the export from those — so there is no filtering step to
+misconfigure, and no copy left behind in a field somebody forgot to clear.
 
 This is a deliberate boundary. Reporting that a coding agent ran forty sessions
 on a host is asset posture. Collecting what was typed into it is not, and this
@@ -68,9 +62,10 @@ running it, needs no elevated privileges, and that user can stop it.
 - **This repository** — endpoint telemetry for agent activity that reaches
   neither of the above.
 
-The three are independent. This one is a Collector distribution built with the
-OpenTelemetry Collector Builder, so it ships as a static binary with the usual
-platform packages, and it works with any OTLP-compatible backend.
+The three are independent. This one is an OpenTelemetry Collector distribution
+carrying a purpose-built receiver, so it ships as a static binary with the usual
+platform packages, works with any OTLP-compatible backend, and is managed by the
+same fleet tooling as any other collector.
 
 ## Licence
 
