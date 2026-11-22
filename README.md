@@ -17,6 +17,21 @@ The fixture path is local and explicit. Live transcript discovery, hook
 installation, background collection, delivery, and assessment are outside the
 current package capability.
 
+## Fixture queue
+
+Pass a dedicated directory containing exactly `claude-session.jsonl` and
+`claude-hooks.json` to `tidewall_collector.reader.read_fixture`. The reader
+checkpoints complete frames and waits for an unterminated JSONL tail to grow.
+Replacement, truncation or a same-size rewrite seals the old generation.
+Use the keyword argument `independent=frozenset({"transcript"})` or
+`independent=frozenset({"hook"})` only for a confirmed independent synthetic
+input. An unchanged active fixture keeps its stream and checkpoints.
+
+`QueueState.create` creates a private directory for one verified origin and
+device. `QueueState.open` acquires the exclusive writer lock for its context.
+Keep that context open through receipt verification. Seven-day expiry and
+capacity losses have separate cumulative counters in the enrollment heartbeat.
+
 ## Development
 
 Use a dedicated environment with pytest, setuptools and wheel.

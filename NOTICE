@@ -22,3 +22,7 @@ from the Tidewall package and src/openaidr/sensor/collectors.py to retain only
 the Claude parser, remove host/path and fallback fields, and require an
 explicit stream. The parser preserves valid sibling observations when a
 tool-use block is malformed. Paths are relative to the OpenAIDR extraction root.
+
+Tidewall modified src/openaidr/sensor/spool.py to bound segment and record
+sizes, fsync positioned JSONL appends, recover partial writes and preserve
+unread segments under the enrollment journal's capacity and cursor rules.
