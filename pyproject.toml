@@ -12,6 +12,9 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "vendor/openaidr/LICENSE"]
 dependencies = []
 
+[project.scripts]
+tidewall-collector = "tidewall_collector.cli:main"
+
 [tool.setuptools]
 packages = ["tidewall_collector"]
 # Dotted modules keep unreviewed sibling Python files out of the wheel.
