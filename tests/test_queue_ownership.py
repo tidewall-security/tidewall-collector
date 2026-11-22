@@ -398,3 +398,125 @@ def test_crash_before_erasure_key_rename_keeps_original_queue(tmp_path):
         assert q.next_batch(A).rows == original.rows
         q.offboard(A)
     assert not path.exists()
+
+
+@pytest.mark.parametrize("operation", ["create", "resume"])
+def test_offboard_rename_during_name_selection(tmp_path, monkeypatch, operation):
+    from tidewall_collector.erasure import detached_path
+
+    path = tmp_path / "queue"
+    detached = detached_path(path, A)
+    with queue(tmp_path, 1):
+        pass
+    script = """
+from pathlib import Path
+import os,sys
+from test_queue_ownership import A,QueueState,QueueError
+with QueueState.open(Path(sys.argv[1]),A) as q:
+    print("ready",flush=True)
+    assert sys.stdin.readline().strip()=="erase"
+    def stop_after_rename(phase):
+        if phase=="erase_detach": os._exit(73)
+    q._boundary=stop_after_rename
+    try: q.offboard(A)
+    except QueueError as exc:
+        if exc.code!="busy": raise
+        print("busy")
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(path)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            assert child.stdout.readline().strip() == "ready"
+            paused = False
+
+            def race():
+                nonlocal paused
+                if paused:
+                    return
+                paused = True
+                out, err = child.communicate("erase\n", timeout=10)
+                assert child.returncode == 73 or (
+                    child.returncode == 0 and out.strip() == "busy"
+                ), err
+
+            with monkeypatch.context() as m:
+                if operation == "create":
+                    lookup = os.path.lexists
+
+                    def after_negative(name):
+                        result = lookup(name)
+                        if name == detached and not result:
+                            race()
+                        return result
+
+                    m.setattr(os.path, "lexists", after_negative)
+                    with pytest.raises(
+                        QueueError, match="^(busy|offboarding|state_exists)$"
+                    ):
+                        with QueueState.create(path, A):
+                            pass
+                else:
+                    real_open = os.open
+
+                    def before_original(name, flags, *args, **kwargs):
+                        if name == path and flags & os.O_DIRECTORY:
+                            race()
+                        return real_open(name, flags, *args, **kwargs)
+
+                    m.setattr(os, "open", before_original)
+                    try:
+                        assert QueueState.resume_offboard(path, A) is True
+                    except QueueError as exc:
+                        assert exc.code == "busy"
+            assert paused
+            if path.exists() or detached.exists():
+                assert QueueState.resume_offboard(path, A)
+            assert not list(tmp_path.iterdir())
+        finally:
+            if child.poll() is None:
+                child.kill()
+
+
+def test_namespace_contention_reports_busy_until_final_key_is_removed(tmp_path):
+    path = tmp_path / "queue"
+    with queue(tmp_path, 1):
+        pass
+    script = """
+from pathlib import Path
+import sys
+from test_queue_ownership import A,QueueState
+with QueueState.open(Path(sys.argv[1]),A) as q:
+    def pause(phase):
+        if phase=="erase_detach":
+            print("detached",flush=True)
+            assert sys.stdin.readline().strip()=="finish"
+    q._boundary=pause
+    q.offboard(A)
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(path)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            assert child.stdout.readline().strip() == "detached"
+            with pytest.raises(QueueError, match="^busy$"):
+                QueueState.resume_offboard(path, A)
+            with pytest.raises(QueueError, match="^busy$"):
+                QueueState.create(path, A)
+            _, err = child.communicate("finish\n", timeout=10)
+            assert child.returncode == 0, err
+        finally:
+            if child.poll() is None:
+                child.kill()
+    assert QueueState.resume_offboard(path, A) is False
+    assert not list(tmp_path.iterdir())

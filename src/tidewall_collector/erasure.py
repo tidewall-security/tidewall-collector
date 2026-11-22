@@ -1,6 +1,5 @@
 """Owner-checked resumption of an explicit local enrollment erasure."""
 
-import fcntl
 import hmac
 import json
 import os
@@ -12,7 +11,16 @@ from uuid import UUID
 from openaidr.core.files import sync_directory
 
 from .admission import canonical, digest
-from .state import DB_PAGES, PAGE_BYTES, Owner, QueueError, _private_file, _read
+from .state import (
+    DB_PAGES,
+    PAGE_BYTES,
+    Owner,
+    QueueError,
+    _private_file,
+    _read,
+    _name_lock,
+    _lock,
+)
 
 
 def detached_path(path: Path, owner: Owner) -> Path:
@@ -122,8 +130,9 @@ def _finish(
         if directory == detached:
             if entries:
                 raise QueueError("quarantined")
-            directory.rmdir()
-            sync_directory(path.parent)
+            with _name_lock(path):
+                directory.rmdir()
+                sync_directory(path.parent)
             return True
         return False
     if len(markers) != 1 or "key" in entries:
@@ -164,20 +173,21 @@ def _finish(
         db.unlink()
         os.fsync(fd)
         boundary("erase_database")
-    if directory != detached:
-        if os.path.lexists(detached):
+    with _name_lock(path):
+        if directory != detached:
+            if os.path.lexists(detached):
+                raise QueueError("quarantined")
+            directory.rename(detached)
+            marker = detached / name
+        sync_directory(path.parent)
+        if _files(detached).keys() != {name}:
             raise QueueError("quarantined")
-        directory.rename(detached)
-        marker = detached / name
-    sync_directory(path.parent)
-    if _files(detached).keys() != {name}:
-        raise QueueError("quarantined")
-    boundary("erase_detach")
-    marker.unlink()
-    os.fsync(fd)
-    boundary("erase_key")
-    detached.rmdir()
-    sync_directory(path.parent)
+        boundary("erase_detach")
+        marker.unlink()
+        os.fsync(fd)
+        boundary("erase_key")
+        detached.rmdir()
+        sync_directory(path.parent)
     return True
 
 
@@ -202,22 +212,21 @@ def begin(
 
 def resume(path: Path, owner: Owner) -> bool:
     detached = detached_path(path, owner)
-    directory = detached if os.path.lexists(detached) else path
+    fd = -1
     try:
         try:
-            fd = os.open(directory, os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW)
+            with _name_lock(path):
+                directory = detached if os.path.lexists(detached) else path
+                fd = os.open(directory, os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW)
+                _lock(fd)
         except FileNotFoundError:
             return False
-        try:
-            info = os.fstat(fd)
-            if info.st_mode & 0o777 != 0o700 or info.st_uid != os.getuid():
-                raise QueueError("quarantined")
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise QueueError("busy") from None
-            return _finish(path, directory, fd, owner, lambda _: None)
-        finally:
-            os.close(fd)
+        info = os.fstat(fd)
+        if info.st_mode & 0o777 != 0o700 or info.st_uid != os.getuid():
+            raise QueueError("quarantined")
+        return _finish(path, directory, fd, owner, lambda _: None)
     except (OSError, sqlite3.Error):
         raise QueueError("blocked_storage") from None
+    finally:
+        if fd >= 0:
+            os.close(fd)

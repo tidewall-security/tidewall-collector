@@ -121,6 +121,24 @@ class PendingBatch:
         )
 
 
+def _lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise QueueError("busy") from None
+
+
+@contextmanager
+def _name_lock(path: Path) -> Iterator[None]:
+    """Serialize active/detached directory entry changes across inode lifetimes."""
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _lock(fd)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _private_file(path: Path) -> os.stat_result:
     info = path.lstat()
     if (
@@ -218,21 +236,21 @@ class QueueState:
         self._db: sqlite3.Connection
         self._blocked = False
         try:
-            if create:
-                from .erasure import detached_path
+            with _name_lock(self.path):
+                if create:
+                    from .erasure import detached_path
 
-                if os.path.lexists(detached_path(self.path, owner)):
-                    raise QueueError("offboarding")
-                try:
-                    self.path.mkdir(mode=0o700)
-                except FileExistsError:
-                    raise QueueError("state_exists") from None
-                sync_directory(self.path.parent)
-            self._dir = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                fcntl.flock(self._dir, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise QueueError("busy") from None
+                    if os.path.lexists(detached_path(self.path, owner)):
+                        raise QueueError("offboarding")
+                    try:
+                        self.path.mkdir(mode=0o700)
+                    except FileExistsError:
+                        raise QueueError("state_exists") from None
+                    sync_directory(self.path.parent)
+                self._dir = os.open(
+                    self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+                _lock(self._dir)
             info = os.fstat(self._dir)
             if info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o700:
                 raise QueueError("quarantined")

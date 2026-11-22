@@ -37,7 +37,10 @@ preserving the logical positions used to verify receipts.
 Call `queue.offboard(owner)` to erase an enrollment. After an interrupted
 erasure, `QueueState.resume_offboard(path, owner)` verifies the original owner
 and finishes deleting that queue. It returns `True` after completing a pending
-erasure and `False` when it finds no matching erasure in progress.
+erasure and `False` when it finds no matching erasure in progress. Selection,
+creation and final removal briefly lock the parent directory. Lock contention
+raises `QueueError("busy")` and can be retried. Use a separate lock file for
+backend credentials when holding a credential lock across queue operations.
 
 ## Development
 
