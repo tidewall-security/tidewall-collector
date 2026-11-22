@@ -43,6 +43,7 @@ def serve_fixture():
     from app.auth.key_utils import hash_key
     from app.db.engine import get_engine, get_session_factory
     from app.db.models import Policy, APIKey
+    from app.interaction_log import InteractionLog
     from app.main import create_app
     import uvicorn
 
@@ -63,6 +64,7 @@ def serve_fixture():
         )
     app = create_app()
     app.state.session_factory = sessions
+    app.state.interaction_log = InteractionLog(sessions)
 
     async def boundary(scope, receive, send):
         path = scope["path"]
@@ -103,7 +105,7 @@ def serve_fixture():
             if message["type"] == "http.response.body" and not reported:
                 reported = True
                 outcomes = []
-                if status == 200 and path.endswith("/observations"):
+                if status == 200 and path == "/v1/collector/observations":
                     outcomes = [
                         r["outcome"] for r in json.loads(message["body"])["results"]
                     ]
@@ -352,7 +354,14 @@ def fleet(tmp_path, installed):
 
 
 def fixture(f):
-    f.call("fixture", "A", "--fixture-dir", str(f.root / "sources"))
+    return f.call("fixture", "A", "--fixture-dir", str(f.root / "sources"))
+
+
+def scoped_items(f, path):
+    status, data = f.request("GET", path, f.admin)
+    assert status == 200
+    assert data["next_cursor"] is None
+    return data["items"]
 
 
 def test_foundation_roundtrip(fleet):
@@ -377,7 +386,26 @@ def test_foundation_roundtrip(fleet):
         ).stderr.strip()
         == "invalid_fixture"
     )
-    fixture(f)
+
+    def assert_private(data):
+        for marker in (
+            b"FIXTURE_PROMPT_SENTINEL",
+            b"FIXTURE_SECRET_SENTINEL",
+            b"FIXTURE_PATH_SENTINEL",
+            b"fixture-url-sentinel.invalid",
+            b"fixture-claude-session-01",
+            b"fixture-call-read",
+        ):
+            if marker in data:
+                pytest.fail(
+                    "raw synthetic source metadata reached a collection surface"
+                )
+
+    captured = fixture(f)
+    assert_private((captured.stdout + captured.stderr).encode())
+    for path in (f.root / "A/queue").rglob("*"):
+        if path.is_file():
+            assert_private(path.read_bytes())
     (f.root / "drop").touch()
     lost = f.call("ship", "A", success=False)
     assert lost.returncode == 75 and lost.stderr.strip() == "offline"
@@ -401,6 +429,27 @@ def test_foundation_roundtrip(fleet):
     assert f.sql(
         "select channel from agent_observations where session_id is null order by channel"
     ) == [("hook",), ("transcript",)]
+    (session,) = scoped_items(f, "/v1/agent-sessions")
+    observations = scoped_items(
+        f, f"/v1/agent-sessions/{session['session_id']}/observations"
+    )
+    unassigned = scoped_items(f, "/v1/agent-observations?unassigned=true")
+    assert (
+        len(observations) == session["observation_count"] == 9 and len(unassigned) == 2
+    )
+    assert all(
+        o["assessment_status"] == "not_assessed" for o in observations + unassigned
+    )
+    (scoped_health,) = scoped_items(f, "/v1/collector-health")
+    assert scoped_health["device_id"] == a["device_id"]
+    assert scoped_health["heartbeat"]["state"] == "source_incomplete"
+    assert_private(
+        json.dumps([session, observations, unassigned, scoped_health]).encode()
+    )
+    for path in f.root.glob("fixture.db*"):
+        assert_private(path.read_bytes())
+    assert_private((f.root / "routes.jsonl").read_bytes())
+
     health = json.loads(f.sql("select heartbeat_json from collector_progress")[0][0])
     assert health["pending"] == 0 and health["state"] == "source_incomplete"
     assert (
@@ -457,7 +506,18 @@ def test_foundation_roundtrip(fleet):
     ) == [(12, 12)]
     print(f"Fixture roundtrip origin {f.origin}")
     assert all(
-        route[0] == ["127.0.0.1", f.port] and route[1] == "POST" for route in f.routes()
+        route[0] == ["127.0.0.1", f.port]
+        and (
+            route[1] == "POST"
+            or route[1:3]
+            in [
+                ["GET", "/v1/agent-sessions"],
+                ["GET", f"/v1/agent-sessions/{session['session_id']}/observations"],
+                ["GET", "/v1/agent-observations"],
+                ["GET", "/v1/collector-health"],
+            ]
+        )
+        for route in f.routes()
     )
 
 
@@ -509,6 +569,36 @@ def test_same_installation_recovery(fleet):
             sender.kill()
             sender.wait()
     assert json.loads(f.call("status", "A").stdout)["status"] == "device_revoked"
+    (previous,) = scoped_items(f, "/v1/agent-sessions")
+    old_path = f"/v1/agent-sessions/{previous['session_id']}/observations"
+    assert len(scoped_items(f, old_path)) == 9
+    (old_health,) = scoped_items(f, "/v1/collector-health")
+    assert old_health["totals"]["invalid_json"] and old_health["heartbeat"]
+    assert f.sql(
+        "select count(*) from collector_outcomes where device_id=? and outcome='rejected'",
+        a["device_id"],
+    ) == [(1,)]
+
+    def check_empty():
+        for table in (
+            "agent_sessions",
+            "agent_observations",
+            "collector_outcomes",
+            "collector_progress",
+        ):
+            assert f.sql(f"select count(*) from {table}") == [(0,)]
+        for query in (
+            "/v1/agent-sessions",
+            "/v1/agent-observations?unassigned=true",
+            "/v1/collector-health",
+        ):
+            assert scoped_items(f, query) == []
+        assert f.request("GET", old_path, f.admin)[0] == 404
+        assert f.sql(
+            "select reason, consumed_at is not null from device_tombstones where device_id=?",
+            a["device_id"],
+        ) == [("revoked by administrator", 1)]
+
     print(f"Recovery origin {f.origin}")
     grant = f.request("POST", path + "/authorise-recovery", f.admin)[1][
         "recovery_secret"
@@ -543,6 +633,11 @@ def test_same_installation_recovery(fleet):
         while not (f.root / "confirmed-201").exists():
             assert time.monotonic() < until
             time.sleep(0.01)
+        # The receiver has committed B; its 201 is still held at the socket.
+        assert len(arrivals.read_bytes().splitlines()) == len(before.splitlines()) + 1
+        check_empty()
+        # The scoped reads above are harness requests recorded by the receiver.
+        before = arrivals.read_bytes()
         directory = os.open(f.root / "B", os.O_RDONLY | os.O_DIRECTORY)
         try:
             fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -552,7 +647,7 @@ def test_same_installation_recovery(fleet):
         finally:
             os.close(directory)
     after = arrivals.read_bytes()
-    assert len(after.splitlines()) == len(before.splitlines()) + 1
+    assert after == before
     wrong_inputs = [inputs[0], ("--recovery-fd", "wrong_fixture_grant")]
     assert (
         f.call("recover", "B", *recover, secrets=wrong_inputs, success=False).returncode
@@ -586,6 +681,7 @@ def test_same_installation_recovery(fleet):
         == 403
     )
     f.approve(b)
+    check_empty()
     f.call("ship", "B")
     with QueueState.open(f.root / "A/queue", owner) as q:
         current = q.next_batch(owner)
