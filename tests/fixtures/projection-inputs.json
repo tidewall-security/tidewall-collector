@@ -1,0 +1,33 @@
+{
+  "canonicalization": "UTF-8 compact JSON with sorted keys; no trailing newline",
+  "hmac": {
+    "algorithm": "HMAC-SHA256",
+    "key_bytes": 32,
+    "message": "UTF-8(domain) followed by one NUL byte followed by UTF-8(value)",
+    "output": "64 lowercase hexadecimal characters",
+    "domains": {
+      "native_session_token": "session",
+      "native_tool_call_token": "tool_call",
+      "source.record_token.native": "native_record",
+      "source.record_token.parser_generated": "parser_record",
+      "source.stream_token": "stream",
+      "source.parser_logical_token": "parser_logical",
+      "source.parser_observation_token": "parser_observation"
+    }
+  },
+  "read_case": {
+    "fixture": "claude-session.jsonl",
+    "line": 2,
+    "part": 1,
+    "byte_position": 329,
+    "adapter_version": "1.0.0",
+    "source_time": "The frozen server vector omits optional source_at. Remove the native timestamp from this synthetic input before parsing. The unchanged corpus separately tests timestamp projection.",
+    "native_inputs": {
+      "session": "fixture-claude-session-01",
+      "tool_call": "fixture-call-read",
+      "native_record": "fixture-message-02",
+      "stream": "fixture-claude-stream-01"
+    }
+  },
+  "server_vectors_sha256": "d4709a1d69e037289efb9d9e0f26597c424c3a86a2698d73dc5a23b40ab6c083"
+}

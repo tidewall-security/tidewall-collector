@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tidewall-collector"
+dynamic = ["version"]
+description = "Private Tidewall Claude fixture metadata collector"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "vendor/openaidr/LICENSE"]
+dependencies = []
+
+[tool.setuptools]
+packages = ["tidewall_collector"]
+# Dotted modules keep unreviewed sibling Python files out of the wheel.
+py-modules = [
+    "openaidr.__init__",
+    "openaidr.core.event",
+    "openaidr.core.files",
+    "openaidr.core.hook_protocol",
+    "openaidr.core.toolmap",
+    "openaidr.sensor.collectors",
+    "openaidr.sensor.spool",
+    "openaidr_common.event",
+]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+tidewall_collector = "src/tidewall_collector"
+openaidr = "vendor/openaidr/src/openaidr"
+"openaidr.core" = "vendor/openaidr/src/openaidr/core"
+"openaidr.sensor" = "vendor/openaidr/src/openaidr/sensor"
+openaidr_common = "vendor/openaidr/packages/common/src/openaidr_common"
+
+[tool.setuptools.dynamic]
+version = {attr = "tidewall_collector.__version__"}
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "vendor/openaidr/src", "vendor/openaidr/packages/common/src"]
+testpaths = ["tests"]

@@ -1,0 +1,58 @@
+{
+  "upstream": "https://github.com/opensecurainc/openaidr",
+  "commit": "7ec2891b0904dad621bb13f24312121d05d4ca03",
+  "license": "Apache-2.0",
+  "upstream_notice": null,
+  "files": {
+    "LICENSE": {
+      "upstream_sha256": "65e29d7c7e4b5682a504b23f3a535029de807640c0c0f34007cfa219e3067087",
+      "redistributed_sha256": "65e29d7c7e4b5682a504b23f3a535029de807640c0c0f34007cfa219e3067087"
+    },
+    "packages/common/src/openaidr_common/__init__.py": {
+      "upstream_sha256": "5e8a915b4f45a550344757f58f96cb78467dc973a1daee508eab5c654579b245",
+      "redistributed_sha256": "5e8a915b4f45a550344757f58f96cb78467dc973a1daee508eab5c654579b245"
+    },
+    "packages/common/src/openaidr_common/event.py": {
+      "upstream_sha256": "258d6bb02f7f7c02c2e2f63a25afa7585d16e84385b5e74c74a9904f5dc710e8",
+      "redistributed_sha256": "258d6bb02f7f7c02c2e2f63a25afa7585d16e84385b5e74c74a9904f5dc710e8"
+    },
+    "src/openaidr/__init__.py": {
+      "upstream_sha256": "3ae0c0eed9cb0631115b6b1061af028184ba148a568575ab9d4a3e088017cd7a",
+      "redistributed_sha256": "0503c1f5d4678a3491d7c1edb6df6248c4f3eaf22bcd1b350dca5174e3fc62f3",
+      "change": "Resolve version and pin from Tidewall Collector without upstream build discovery."
+    },
+    "src/openaidr/core/__init__.py": {
+      "upstream_sha256": "303f78124a532909ea23ba8ce945c7ecc4fe205b368f1f8e09ce889433039472",
+      "redistributed_sha256": "303f78124a532909ea23ba8ce945c7ecc4fe205b368f1f8e09ce889433039472"
+    },
+    "src/openaidr/core/event.py": {
+      "upstream_sha256": "a3d3bc5674af52087698cfc016bc8d3d915036cb25b332bb98f2677bc1a99364",
+      "redistributed_sha256": "a3d3bc5674af52087698cfc016bc8d3d915036cb25b332bb98f2677bc1a99364"
+    },
+    "src/openaidr/core/files.py": {
+      "upstream_sha256": "2fe7ea9a4fa06abb3a4aaaef457689a447de50a36d009d75d4d642f0c88545af",
+      "redistributed_sha256": "2fe7ea9a4fa06abb3a4aaaef457689a447de50a36d009d75d4d642f0c88545af"
+    },
+    "src/openaidr/core/hook_protocol.py": {
+      "upstream_sha256": "d5dfaedf5a037565280f9e781193cb57daa79d4f8b3758e6a212964eb674b850",
+      "redistributed_sha256": "d5dfaedf5a037565280f9e781193cb57daa79d4f8b3758e6a212964eb674b850"
+    },
+    "src/openaidr/core/toolmap.py": {
+      "upstream_sha256": "43efbeb42bf2537a610facc9c387b445e3955c87c6ea54bdc293ab25439877b8",
+      "redistributed_sha256": "43efbeb42bf2537a610facc9c387b445e3955c87c6ea54bdc293ab25439877b8"
+    },
+    "src/openaidr/sensor/__init__.py": {
+      "upstream_sha256": "681c4321535d980446a1ba64ff1a645231e14fab09e960b1cf5242da01f2cf9f",
+      "redistributed_sha256": "681c4321535d980446a1ba64ff1a645231e14fab09e960b1cf5242da01f2cf9f"
+    },
+    "src/openaidr/sensor/collectors.py": {
+      "upstream_sha256": "d3b44aef9dac7862a527ba2f2d5c327fb1d2d2b49cc406ba543729d86238414e",
+      "redistributed_sha256": "ace293d5e8166dbef17893a6d54fedcbf2d63863b1b78461989f8f8bb940929c",
+      "change": "Retain the Claude parser and evidence helpers. Remove other parsers, polling, discovery, host/path and fallback fields. Require an opaque stream and identify parser-generated record provenance."
+    },
+    "src/openaidr/sensor/spool.py": {
+      "upstream_sha256": "0318c76986fb05328f32ad750bd82991fcd66406264a6b6f9fe1d8796b811c0c",
+      "redistributed_sha256": "0318c76986fb05328f32ad750bd82991fcd66406264a6b6f9fe1d8796b811c0c"
+    }
+  }
+}

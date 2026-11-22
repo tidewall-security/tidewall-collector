@@ -1,0 +1,39 @@
+[
+  {
+    "session_id": "fixture-claude-session-01",
+    "cwd": "/Users/FIXTURE_PATH_SENTINEL/lantern",
+    "transcript_path": "/Users/FIXTURE_PATH_SENTINEL/lantern/session.jsonl",
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "FIXTURE_PROMPT_SENTINEL — describe a paper lantern."
+  },
+  {
+    "session_id": "fixture-claude-session-01",
+    "cwd": "/Users/FIXTURE_PATH_SENTINEL/lantern",
+    "transcript_path": "/Users/FIXTURE_PATH_SENTINEL/lantern/session.jsonl",
+    "tool_name": "Read",
+    "tool_use_id": "fixture-call-read",
+    "tool_input": {
+      "file_path": "/Users/FIXTURE_PATH_SENTINEL/lantern/note.txt"
+    },
+    "hook_event_name": "PreToolUse"
+  },
+  {
+    "session_id": "fixture-claude-session-01",
+    "cwd": "/Users/FIXTURE_PATH_SENTINEL/lantern",
+    "transcript_path": "/Users/FIXTURE_PATH_SENTINEL/lantern/session.jsonl",
+    "tool_name": "Read",
+    "tool_use_id": "fixture-call-read",
+    "tool_input": {
+      "file_path": "/Users/FIXTURE_PATH_SENTINEL/lantern/note.txt"
+    },
+    "hook_event_name": "PostToolUse",
+    "tool_response": "FIXTURE_SECRET_SENTINEL"
+  },
+  {
+    "hook_event_name": "PostToolUse",
+    "tool_name": "WebFetch",
+    "tool_response": {
+      "url": "https://fixture-url-sentinel.invalid/lantern"
+    }
+  }
+]
