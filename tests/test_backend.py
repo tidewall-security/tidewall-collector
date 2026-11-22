@@ -313,6 +313,48 @@ def test_unknown_heartbeat_replays_immutable_snapshot_after_local_changes(
         assert {**third, "revision": second["revision"]} == second
 
 
+def test_replayed_heartbeat_expires_local_rows_across_restart(client, monkeypatch):
+    from tidewall_collector import state
+
+    back, owner, q, receiver = client
+    now = 3_000_000_000
+    monkeypatch.setattr(state.time, "time", lambda: now)
+    bodies: list[bytes] = []
+
+    def record(origin, path, token, body, limit):
+        assert path == HEALTH
+        bodies.append(body)
+        return receiver(origin, path, token, body, limit)
+
+    monkeypatch.setattr(back, "_post", record)
+    q.admit_record(owner, STREAM, 0, 1, [obs(1)])
+    (segment,) = q._spool.segments()
+    receiver.answers.append(BackendError("offline"))
+    with pytest.raises(BackendError, match="offline"):
+        back.send_heartbeat(owner, q)
+    first = json.loads(bodies[0])
+    assert first["pending"] == 1 and first["totals"]["expired"] == 0
+    assert first["queue_bytes"] == segment.stat().st_size > 0
+    q.close()
+
+    now += 7 * 86400 + 1
+    assert back.root is not None
+    restarted = TidewallBackend(back.root)
+    monkeypatch.setattr(restarted, "_post", record)
+    with QueueState.open(back.root / "queue", owner) as reopened:
+        restarted.send_heartbeat(owner, reopened)
+        assert bodies == [bodies[0], bodies[0]]
+        assert not segment.exists()
+        journal = reopened._load()
+        assert journal["pending"] == 0 and journal["totals"]["expired"] == 1
+        assert journal["loss_evidence"]["expired"][0] == 1
+        restarted.send_heartbeat(owner, reopened)
+        fresh = json.loads(bodies[2])
+        assert fresh["revision"] > first["revision"]
+        assert fresh["pending"] == fresh["queue_bytes"] == 0
+        assert fresh["totals"] == {**first["totals"], "expired": 1}
+
+
 def test_heartbeat_commit_failure_keeps_same_delivery(client, monkeypatch):
     from tidewall_collector.state import QueueError
 

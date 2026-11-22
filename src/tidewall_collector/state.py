@@ -982,8 +982,6 @@ class QueueState:
     def heartbeat(self, owner: Owner, *, prepare_delivery: bool = False) -> dict:
         with self._operation(owner, recover=False) as j:
             self._inventory(j)
-            if prepare_delivery and j.get("pending_heartbeat") is not None:
-                return j["pending_heartbeat"]
             if (
                 not self._blocked
                 and j["contract"] == admission.CONTRACT
@@ -992,6 +990,8 @@ class QueueState:
             ):
                 self._recover(j)
                 self._expire(j)
+            if prepare_delivery and j.get("pending_heartbeat") is not None:
+                return j["pending_heartbeat"]
             status = j["status"]
             if status == "ready" and any(
                 s["tail"] or s["sealed"] for s in j["sources"].values()
