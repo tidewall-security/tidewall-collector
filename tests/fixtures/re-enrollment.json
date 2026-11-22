@@ -1,0 +1,40 @@
+{
+  "fixture_version": 1,
+  "status": "proposed_phase_1_acceptance_fixture",
+  "queued_enrollment": {
+    "server_origin": "https://fixture-tidewall.invalid",
+    "device_id": "00000000-0000-4000-8000-00000000000a",
+    "installation_id": "00000000-0000-4000-8000-000000000001",
+    "bound_policy_id": "fixture-policy-01",
+    "credential_generation": 1
+  },
+  "queued_metadata": [
+    {
+      "source_observation_id": "fixture-observation-a-01",
+      "native_session_id": "fixture-session-01",
+      "kind": "prompt"
+    },
+    {
+      "source_observation_id": "fixture-observation-a-02",
+      "native_session_id": "fixture-session-01",
+      "kind": "tool.call"
+    }
+  ],
+  "proposed_enrollment": {
+    "server_origin": "https://fixture-tidewall.invalid",
+    "device_id": "00000000-0000-4000-8000-00000000000b",
+    "installation_id": "00000000-0000-4000-8000-000000000001",
+    "bound_policy_id": "fixture-policy-01",
+    "credential_generation": 1
+  },
+  "expected": {
+    "replacement_while_a_has_pending_rows": "refuse_switch_and_leave_A_queue_unchanged",
+    "same_identity_refresh": "allow_replay_using_A_after_validating_new_A_access_credential",
+    "submit_a_rows_with_b_credentials": "reject_A_bound_batch_before_persistence",
+    "apply_b_receipt_to_a_queue": "reject_without_advancing_A_cursor",
+    "a_revoked_or_recovered_as_b": "stop_A_delivery_and_leave_A_state_isolated_pending_explicit_disposition",
+    "rewrite_a_source_observation_ids": false,
+    "acknowledge_a_rows_under_b": false,
+    "persist_a_rows_under_b": 0
+  }
+}

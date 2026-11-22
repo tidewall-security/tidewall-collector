@@ -1,17 +1,44 @@
-# OpenTelemetry Collector Builder output
+# Build outputs
 /_build/
+/build/
 /dist/
 otelcol-tidewall
 *.tar.gz
 *.deb
 *.rpm
 *.msi
+*.whl
+*.egg-info/
 
-# Go
-/vendor/
+# Only the selected OpenAIDR extraction is tracked under vendor.
+/vendor/*
+!/vendor/openaidr/
+/vendor/openaidr/**
+!/vendor/openaidr/**/
+!/vendor/openaidr/LICENSE
+!/vendor/openaidr/source-lock.json
+!/vendor/openaidr/src/openaidr/__init__.py
+!/vendor/openaidr/src/openaidr/core/__init__.py
+!/vendor/openaidr/src/openaidr/core/event.py
+!/vendor/openaidr/src/openaidr/core/files.py
+!/vendor/openaidr/src/openaidr/core/hook_protocol.py
+!/vendor/openaidr/src/openaidr/core/toolmap.py
+!/vendor/openaidr/src/openaidr/sensor/__init__.py
+!/vendor/openaidr/src/openaidr/sensor/collectors.py
+!/vendor/openaidr/src/openaidr/sensor/spool.py
+!/vendor/openaidr/packages/common/src/openaidr_common/__init__.py
+!/vendor/openaidr/packages/common/src/openaidr_common/event.py
+
+# Local Python environment and caches
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+__pycache__/
+*.py[cod]
 
 # Local collector state and config overrides
 *.local.yaml
 /storage/
+/state/
 
 .DS_Store
