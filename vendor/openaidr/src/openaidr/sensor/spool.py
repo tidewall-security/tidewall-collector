@@ -1,5 +1,6 @@
 """Segmented JSONL disk queue. Tidewall adds bounded, replayable positioned writes."""
 
+import hashlib
 import json
 import os
 import re
@@ -93,6 +94,51 @@ class Spool:
             if not 0 < len(line) <= MAX_LINE or not line.endswith(b"\n"):
                 raise ValueError("invalid segment")
             return line, f.tell()
+
+    def suffix_digest(self, number, cut, original):
+        if not 0 < cut < original <= self.max_segment:
+            raise ValueError("invalid compaction")
+        with os.fdopen(
+            os.open(self._path(number), os.O_RDONLY | os.O_NOFOLLOW), "rb"
+        ) as f:
+            if os.fstat(f.fileno()).st_size != original:
+                raise ValueError("invalid segment")
+            f.seek(cut)
+            return hashlib.sha256(f.read(original - cut)).hexdigest()
+
+    def compact_prefix(self, plan, save_progress, boundary):
+        """Replay a left shift without a second segment or overlapping a live source chunk."""
+        number, cut, original = plan["segment"], plan["cut"], plan["original"]
+        kept = original - cut
+        moved = plan["moved"]
+        if not (0 < cut < original <= self.max_segment and 0 <= moved <= kept):
+            raise ValueError("invalid compaction")
+        with os.fdopen(
+            os.open(self._path(number), os.O_RDWR | os.O_NOFOLLOW), "r+b", buffering=0
+        ) as f:
+            fd = f.fileno()
+            size = os.fstat(fd).st_size
+            if size != original and not (moved == kept and size == kept):
+                raise ValueError("invalid segment")
+            checked = hashlib.sha256(os.pread(fd, moved, 0))
+            checked.update(os.pread(fd, kept - moved, cut + moved))
+            if checked.hexdigest() != plan["digest"]:
+                raise ValueError("invalid segment")
+            while moved < kept:
+                length = min(kept - moved, cut, 32 << 10)
+                chunk = os.pread(fd, length, cut + moved)
+                if len(chunk) != length or os.pwrite(fd, chunk, moved) != length:
+                    raise OSError("incomplete compaction")
+                os.fsync(fd)
+                if os.pread(fd, length, moved) != chunk:
+                    raise OSError("incomplete compaction")
+                boundary("compact_write")
+                moved += length
+                save_progress(moved)
+                boundary("compact_progress")
+            os.ftruncate(fd, kept)
+            os.fsync(fd)
+            boundary("compact_truncate")
 
     def append(self, event):
         line = (json.dumps(event, separators=(",", ":")) + "\n").encode()

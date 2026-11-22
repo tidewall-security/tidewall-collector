@@ -31,6 +31,13 @@ input. An unchanged active fixture keeps its stream and checkpoints.
 device. `QueueState.open` acquires the exclusive writer lock for its context.
 Keep that context open through receipt verification. Seven-day expiry and
 capacity losses have separate cumulative counters in the enrollment heartbeat.
+Expiry physically reclaims the consumed prefix of a mixed-age segment while
+preserving the logical positions used to verify receipts.
+
+Call `queue.offboard(owner)` to erase an enrollment. After an interrupted
+erasure, `QueueState.resume_offboard(path, owner)` verifies the original owner
+and finishes deleting that queue. It returns `True` after completing a pending
+erasure and `False` when it finds no matching erasure in progress.
 
 ## Development
 

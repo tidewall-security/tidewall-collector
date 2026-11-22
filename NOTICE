@@ -26,3 +26,4 @@ tool-use block is malformed. Paths are relative to the OpenAIDR extraction root.
 Tidewall modified src/openaidr/sensor/spool.py to bound segment and record
 sizes, fsync positioned JSONL appends, recover partial writes and preserve
 unread segments under the enrollment journal's capacity and cursor rules.
+It reclaims retired prefixes with a journaled in-place copy and file fsync.

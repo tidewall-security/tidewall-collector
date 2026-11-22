@@ -268,3 +268,50 @@ def test_storage_error_holds_durable_source_position_and_retry_keeps_rows(
         q.admit_record(A, STREAM, 10, 11, [obs(10), obs(11)])
         assert q.checkpoint(A, STREAM) == 11
         assert [r.ordinal for r in q.next_batch(A).rows] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "channel,name",
+    [("transcript", "claude-session.jsonl"), ("hook", "claude-hooks.json")],
+)
+def test_observe_replacement_then_restore_original_never_relabels(
+    tmp_path, channel, name
+):
+    root = fixtures(tmp_path / "fixture")
+    with QueueState.create(tmp_path / "q", A) as q:
+        read_fixture(root, A, q)
+        rows = q.next_batch(A).rows
+        old = tmp_path / "original"
+        (root / name).rename(old)
+        replacement = b"[]" if channel == "hook" else b"{}\n"
+        (root / name).write_bytes(replacement)
+        with pytest.raises(QueueError, match="source_changed"):
+            read_fixture(root, A, q)
+        (root / name).rename(tmp_path / "replacement")
+        old.rename(root / name)
+        with pytest.raises(QueueError, match="stale_fixture"):
+            read_fixture(root, A, q, independent=frozenset({channel}))
+        assert q.next_batch(A).rows == rows
+        (root / name).rename(old)
+        (tmp_path / "replacement").rename(root / name)
+        read_fixture(root, A, q, independent=frozenset({channel}))
+        assert q.next_batch(A).rows[: len(rows)] == rows
+
+
+def test_restored_same_inode_generation_after_confirmed_truncation_stays_sealed(
+    tmp_path,
+):
+    root = fixtures(tmp_path / "fixture")
+    p = root / "claude-session.jsonl"
+    original = p.read_bytes()
+    old_time = p.stat().st_mtime_ns
+    with QueueState.create(tmp_path / "q", A) as q:
+        read_fixture(root, A, q)
+        p.write_bytes(b"{}\n")
+        read_fixture(root, A, q, independent=frozenset({"transcript"}))
+        previous = q.next_batch(A).rows
+        p.write_bytes(original)
+        os.utime(p, ns=(old_time, old_time))
+        with pytest.raises(QueueError, match="stale_fixture"):
+            read_fixture(root, A, q, independent=frozenset({"transcript"}))
+        assert q.next_batch(A).rows == previous

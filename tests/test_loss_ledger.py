@@ -298,3 +298,183 @@ def test_canonical_size_boundary():
     admission.check_observation_size(b"x" * 4096)
     with pytest.raises(admission.Invalid):
         admission.check_observation_size(b"x" * 4097)
+
+
+def test_heartbeat_expiry_preserves_quarantined_suffix(tmp_path, monkeypatch):
+    clock = [1_000_000]
+    monkeypatch.setattr(state_module.time, "time", lambda: clock[0])
+    with queue(tmp_path, 1) as q:
+        segment = q._spool.segments()[0]
+        with segment.open("ab") as f:
+            f.write(b"unexpected")
+        damaged = segment.read_bytes()
+        before = q._load()
+        with pytest.raises(QueueError, match="quarantined"):
+            q.next_batch(A)
+        clock[0] += 604800
+        with pytest.raises(QueueError, match="quarantined"):
+            q.heartbeat(A)
+        after = q._load()
+        for field in ("cursor", "totals", "pending", "segments", "clock"):
+            assert after[field] == before[field]
+        assert segment.read_bytes() == damaged
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "compact_intent",
+        "compact_write",
+        "compact_progress",
+        "compact_truncate",
+        "compact_commit",
+    ],
+)
+def test_mixed_age_expiry_reclaims_bytes_across_process_death(
+    tmp_path, cut, monkeypatch
+):
+    import os
+    import sys
+    import subprocess
+
+    clock = [1_000_000]
+    monkeypatch.setattr(state_module.time, "time", lambda: clock[0])
+    with QueueState.create(tmp_path / "q", A) as q:
+        q.admit_record(A, STREAM, 0, 1, [obs(111)])
+        clock[0] += 86400
+        q.admit_record(A, STREAM, 1, 2, [obs(i) for i in range(220, 226)])
+        original = q.next_batch(A).rows
+        seg = q._spool.segments()[0]
+        old_size = seg.stat().st_size
+    script = """
+from test_queue_ownership import A,QueueState
+from tidewall_collector import state
+from pathlib import Path
+import os,sys
+state.time.time=lambda:1000000+604800
+q=QueueState.open(Path(sys.argv[1]),A)
+def cut(name):
+    if name==sys.argv[2]: os._exit(71)
+q._boundary=cut
+q.heartbeat(A)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "q"), cut],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+    )
+    assert result.returncode == 71
+    clock[0] = 1_604_800
+    with QueueState.open(tmp_path / "q", A) as q:
+        p = q.next_batch(A)
+        assert p.rows == original[1:]
+        assert (
+            original[0].data not in seg.read_bytes()
+            and len(seg.read_bytes()) < old_size
+        )
+        hb = q.heartbeat(A)
+        assert hb["totals"]["expired"] == 1 and hb["queue_bytes"] == seg.stat().st_size
+        assert q.apply_receipt(A, p, json.dumps(receipt(p)).encode()) == 6
+
+
+def test_acknowledged_prefix_expires_during_newer_inflight_receipt(
+    tmp_path, monkeypatch
+):
+    clock = [1_000_000]
+    monkeypatch.setattr(state_module.time, "time", lambda: clock[0])
+    with queue(tmp_path, 1) as q:
+        clock[0] += 1000
+        q.admit_record(A, STREAM, 10, 11, [obs(99)])
+        original = q.next_batch(A)
+        q.apply_receipt(A, original, json.dumps(receipt(original, 1)).encode())
+        p = q.next_batch(A)
+        clock[0] = 1_604_800
+        assert q.heartbeat(A)["totals"]["expired"] == 0
+        assert original.rows[0].data not in q._spool.segments()[0].read_bytes()
+        assert q.apply_receipt(A, p, json.dumps(receipt(p)).encode()) == 1
+
+
+@pytest.mark.parametrize("failure", ["short_write", "post_truncate"])
+def test_real_file_reclamation_errors_retry_same_logical_cursor(
+    tmp_path, monkeypatch, failure
+):
+    import os
+
+    clock = [1_000_000]
+    monkeypatch.setattr(state_module.time, "time", lambda: clock[0])
+    with queue(tmp_path, 1) as q:
+        clock[0] += 10
+        q.admit_record(A, STREAM, 10, 11, [obs(501), obs(502)])
+        before = q.next_batch(A)
+        segment = q._spool.segments()[0]
+        peak = segment.stat().st_size
+        clock[0] = 1_604_800
+        with monkeypatch.context() as m:
+            if failure == "short_write":
+                real = os.pwrite
+
+                def short(fd, data, offset):
+                    return real(fd, data[: len(data) // 2], offset)
+
+                m.setattr(os, "pwrite", short)
+            else:
+                truncate = os.ftruncate
+
+                def fail(fd, size):
+                    truncate(fd, size)
+                    raise OSError("synthetic fault")
+
+                m.setattr(os, "ftruncate", fail)
+            with pytest.raises(QueueError, match="blocked_storage"):
+                q.heartbeat(A)
+        assert sum(p.stat().st_size for p in q._spool.segments()) <= peak
+    with QueueState.open(tmp_path / "queue", A) as q:
+        p = q.next_batch(A)
+        assert p.rows == before.rows[1:] and q.heartbeat(A)["totals"]["expired"] == 1
+        assert before.rows[0].data not in segment.read_bytes()
+        q.admit_record(A, STREAM, 11, 12, [obs(503)])
+        assert q.apply_receipt(A, p, json.dumps(receipt(p)).encode()) == 2
+        assert q.next_batch(A).rows[0].ordinal == 4
+
+
+def test_restart_between_expiry_cursor_and_compaction_purges_mixed_prefix(
+    tmp_path, monkeypatch
+):
+    clock = [1_000_000]
+    monkeypatch.setattr(state_module.time, "time", lambda: clock[0])
+    with queue(tmp_path, 1) as q:
+        clock[0] += 10
+        q.admit_record(A, STREAM, 10, 11, [obs(104)])
+        original = q.next_batch(A).rows
+        seg = q._spool.segments()[0]
+        clock[0] = 1_604_800
+
+        def cut(phase):
+            if phase == "after_cursor":
+                raise OSError()
+
+        q._boundary = cut
+        with pytest.raises(QueueError):
+            q.heartbeat(A)
+    with QueueState.open(tmp_path / "queue", A) as q:
+        assert original[0].data not in seg.read_bytes()
+        assert q.next_batch(A).rows == original[1:]
+
+
+def test_reopen_preserves_unexplained_bytes_after_pending_unlink(tmp_path):
+    with queue(tmp_path, 1) as q:
+        p = q.next_batch(A)
+        seg = q._spool.segments()[0]
+
+        def cut(name):
+            if name == "before_unlink":
+                raise OSError()
+
+        q._boundary = cut
+        with pytest.raises(QueueError):
+            q.apply_receipt(A, p, json.dumps(receipt(p)).encode())
+    with seg.open("ab") as f:
+        f.write(b"unexplained")
+    original = seg.read_bytes()
+    with pytest.raises(QueueError, match="quarantined"):
+        QueueState.open(tmp_path / "queue", A)
+    assert seg.read_bytes() == original

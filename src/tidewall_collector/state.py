@@ -174,6 +174,32 @@ def _initial(generation: str) -> dict:
     }
 
 
+def _segment_bounds(j: dict) -> dict[int, list[int]]:
+    bounds = {int(n): [size, size] for n, size in j["segments"].items()}
+    for n, offset, row in (j["intent"] or {}).get("rows", []):
+        bounds.setdefault(n, [0, 0])[1] = offset + len(canonical(row)) + 1
+    return bounds
+
+
+def _permitted_size(j: dict, bounds: dict[int, list[int]], n: int, size: int) -> bool:
+    if n in j["unlink"]:
+        expected = j.get("unlink_sizes", {}).get(str(n))
+        # Older journals have no per-segment unlink sizes. Their last end
+        # cursor remains authoritative; verify every retired frame on cleanup.
+        if expected is None and n == j["cursor"][0]:
+            expected = j["cursor"][1]
+        return size == expected if expected is not None else 0 < size <= SEGMENT_LIMIT
+    compact = j.get("compact")
+    if (
+        compact
+        and n == compact["segment"]
+        and compact["moved"] == compact["original"] - compact["cut"]
+        and size == compact["moved"]
+    ):
+        return True
+    return n in bounds and bounds[n][0] <= size <= bounds[n][1]
+
+
 class QueueState:
     """Hold this handle (and its directory lock) through send and verification."""
 
@@ -193,6 +219,10 @@ class QueueState:
         self._blocked = False
         try:
             if create:
+                from .erasure import detached_path
+
+                if os.path.lexists(detached_path(self.path, owner)):
+                    raise QueueError("offboarding")
                 try:
                     self.path.mkdir(mode=0o700)
                 except FileExistsError:
@@ -262,6 +292,10 @@ class QueueState:
             if self._db.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
                 raise QueueError("quarantined")
             self._inventory(self._load())
+            # A crash before the erasure-key rename leaves a reversible preparation.
+            # Normal opens still possess the original key and discard that preparation.
+            with self._db:
+                self._db.execute("DROP TABLE IF EXISTS erase_proof")
             self._spool = Spool(self.path, SEGMENT_LIMIT, DATA_LIMIT)
             self.reconcile(owner)
         except BaseException as exc:
@@ -384,10 +418,7 @@ class QueueState:
             return self._key
 
     def _inventory(self, j: dict) -> None:
-        bounds = {int(n): [size, size] for n, size in j["segments"].items()}
-        for n, offset, row in (j["intent"] or {}).get("rows", []):
-            bounds.setdefault(n, [0, 0])[1] = offset + len(canonical(row)) + 1
-        deleting = set(j["unlink"])
+        bounds = _segment_bounds(j)
         seen = set()
         for p in self.path.iterdir():
             if p.name in ("key", "manifest.json", "state.db", "state.db-journal"):
@@ -402,9 +433,7 @@ class QueueState:
                 raise QueueError("quarantined")
             n = int(p.stem)
             size = _private_file(p).st_size
-            if n not in deleting and (
-                n not in bounds or not bounds[n][0] <= size <= bounds[n][1]
-            ):
+            if not _permitted_size(j, bounds, n, size):
                 raise QueueError("quarantined")
             seen.add(n)
         if any(low and n not in seen for n, (low, high) in bounds.items()):
@@ -414,6 +443,8 @@ class QueueState:
         self._inventory(j)
         if j["contract"] != admission.CONTRACT:
             return
+        if j.get("compact"):
+            self._finish_compaction(j)
         if j["intent"] is not None:
             self._finish_record(j)
         if j["terminal"] is not None:
@@ -422,7 +453,9 @@ class QueueState:
             self._cleanup(j)
 
     def reconcile(self, owner: Owner) -> None:
-        with self._operation(owner):
+        with self._operation(owner) as j:
+            if j["contract"] == admission.CONTRACT:
+                self._reclaim_due_prefix(j, max(int(time.time()), j["clock"]))
             self._blocked = False
 
     def checkpoint(self, owner: Owner, stream: UUID) -> int:
@@ -547,28 +580,34 @@ class QueueState:
                 raise QueueError("blocked_storage")
             j["totals"][k] += n
 
+    def _read_row(self, number: int, offset: int, base: int) -> PendingRow:
+        try:
+            data, end = self._spool.read_at(number, offset)
+            ordinal, ts, sha, tag, o = json.loads(data)
+            body = canonical(o)
+            if digest(body) != sha or not hmac.compare_digest(
+                self._seal(ordinal, ts, sha), tag
+            ):
+                raise ValueError
+            return PendingRow(ordinal, body, sha, (number, base + end), ts)
+        except (ValueError, TypeError, RecursionError):
+            raise QueueError("quarantined") from None
+
     def _rows(self, j: dict) -> Iterator[PendingRow]:
         seg, pos = j["cursor"]
         previous = j["next_ordinal"] - j["pending"] - 1
         for number in sorted(map(int, j["segments"])):
             if number < seg:
                 continue
-            offset = pos if number == seg else 0
+            base = j.get("bases", {}).get(str(number), 0)
+            offset = pos - base if number == seg else 0
             while offset < j["segments"][str(number)]:
-                try:
-                    data, offset = self._spool.read_at(number, offset)
-                    ordinal, ts, sha, tag, o = json.loads(data)
-                    body = canonical(o)
-                    if (
-                        ordinal != previous + 1
-                        or digest(body) != sha
-                        or not hmac.compare_digest(self._seal(ordinal, ts, sha), tag)
-                    ):
-                        raise QueueError("quarantined")
-                except (ValueError, TypeError, RecursionError):
-                    raise QueueError("quarantined") from None
-                previous = ordinal
-                yield PendingRow(ordinal, body, sha, (number, offset), ts)
+                row = self._read_row(number, offset, base)
+                if row.ordinal != previous + 1:
+                    raise QueueError("quarantined")
+                previous = row.ordinal
+                offset = row.end[1] - base
+                yield row
         if previous != j["next_ordinal"] - 1:
             raise QueueError("quarantined")
 
@@ -606,10 +645,13 @@ class QueueState:
         j["unlink"] = [
             int(n)
             for n, size in j["segments"].items()
-            if int(n) < seg or (int(n) == seg and pos == size)
+            if int(n) < seg
+            or (int(n) == seg and pos == size + j.get("bases", {}).get(n, 0))
         ]
+        j["unlink_sizes"] = {str(n): j["segments"][str(n)] for n in j["unlink"]}
         for n in j["unlink"]:
             del j["segments"][str(n)]
+            j.get("bases", {}).pop(str(n), None)
         j["terminal"] = None
         self._boundary("before_cursor")
         self._save(j)
@@ -619,18 +661,103 @@ class QueueState:
         if not j["unlink"]:
             return
         self._boundary("before_unlink")
+        self._inventory(j)
+        for n in j["unlink"]:
+            path = self.path / f"{n:020d}.jsonl"
+            if path.exists():
+                self._verify_segment(
+                    n,
+                    _private_file(path).st_size,
+                    0,
+                    ceiling=j["next_ordinal"] - j["pending"] - 1,
+                )
         for n in j["unlink"]:
             (self.path / f"{n:020d}.jsonl").unlink(missing_ok=True)
         sync_directory(self.path)
         self._boundary("after_unlink")
         j["unlink"] = []
+        j.pop("unlink_sizes", None)
         self._save(j)
+
+    def _verify_segment(
+        self,
+        segment: int,
+        size: int,
+        base: int,
+        *,
+        cursor: tuple[int, int] | None = None,
+        ceiling: int | None = None,
+    ) -> None:
+        offset = 0
+        previous = None
+        matched = cursor is None
+        while offset < size:
+            row = self._read_row(segment, offset, base)
+            if previous is not None and row.ordinal != previous + 1:
+                raise QueueError("quarantined")
+            if ceiling is not None and row.ordinal > ceiling:
+                raise QueueError("quarantined")
+            if cursor == (row.end[1], row.ordinal):
+                matched = True
+            previous = row.ordinal
+            offset = row.end[1] - base
+        if not matched or offset != size:
+            raise QueueError("quarantined")
+
+    def _reclaim_due_prefix(self, j: dict, now: int) -> None:
+        segment, logical = j["cursor"]
+        n = str(segment)
+        size = j["segments"].get(n, 0)
+        base = j.get("bases", {}).get(n, 0)
+        cut = logical - base
+        if not 0 < cut < size:
+            return
+        first = self._read_row(segment, 0, base)
+        if first.enqueued_at + TTL > now:
+            return
+        self._verify_segment(
+            segment, size, base, cursor=(logical, j["next_ordinal"] - j["pending"] - 1)
+        )
+        try:
+            suffix_digest = self._spool.suffix_digest(segment, cut, size)
+        except ValueError:
+            raise QueueError("quarantined") from None
+        j["compact"] = {
+            "segment": segment,
+            "original": size,
+            "cut": cut,
+            "moved": 0,
+            "digest": suffix_digest,
+        }
+        self._save(j)
+        self._boundary("compact_intent")
+        self._finish_compaction(j)
+
+    def _finish_compaction(self, j: dict) -> None:
+        plan = j["compact"]
+
+        def save_progress(moved: int) -> None:
+            plan["moved"] = moved
+            self._save(j)
+
+        try:
+            self._spool.compact_prefix(plan, save_progress, self._boundary)
+        except ValueError:
+            raise QueueError("quarantined") from None
+        n = str(plan["segment"])
+        bases = j.setdefault("bases", {})
+        bases[n] = bases.get(n, 0) + plan["cut"]
+        j["segments"][n] = plan["original"] - plan["cut"]
+        j["compact"] = None
+        self._save(j)
+        self._boundary("compact_commit")
 
     def _expire(self, j: dict) -> None:
         now = max(int(time.time()), j["clock"])
         if now > j["clock"]:
             j["clock"] = now
             self._save(j)
+        verified: set[int] = set()
         while j["pending"]:
             expired = []
             for r in self._rows(j):
@@ -641,7 +768,13 @@ class QueueState:
                     break
             if not expired:
                 break
+            for n in {r.end[0] for r in expired} - verified:
+                self._verify_segment(
+                    n, j["segments"][str(n)], j.get("bases", {}).get(str(n), 0)
+                )
+                verified.add(n)
             self._terminal(j, expired, ["expired"] * len(expired))
+        self._reclaim_due_prefix(j, now)
 
     def _batch(self, j: dict, batch_id: UUID, limit: int) -> PendingBatch | None:
         rows: list[PendingRow] = []
@@ -792,12 +925,14 @@ class QueueState:
 
     def heartbeat(self, owner: Owner) -> dict:
         with self._operation(owner, recover=False) as j:
+            self._inventory(j)
             if (
                 not self._blocked
                 and j["contract"] == admission.CONTRACT
                 and j["intent"] is None
                 and j["terminal"] is None
             ):
+                self._recover(j)
                 self._expire(j)
             status = j["status"]
             if status == "ready" and any(
@@ -828,16 +963,31 @@ class QueueState:
             return dict(snapshot, revision=j["revision"])
 
     def offboard(self, owner: Owner) -> None:
+        from . import erasure
+
         with self._operation(owner, recover=False) as j:
             self._inventory(j)
+            erasure.prepare(self.path, self._db, self.generation, self._key)
+            self._boundary("erase_prepared")
             self._db.close()
-            for p in self.path.iterdir():
-                _private_file(p)
-                p.unlink()
-            os.fsync(self._dir)
-            self.path.rmdir()
-            sync_directory(self.path.parent)
-            self.close()
+            try:
+                erasure.begin(
+                    self.path,
+                    self._dir,
+                    owner,
+                    self.generation,
+                    self._key,
+                    self._boundary,
+                )
+            finally:
+                self.close()
+
+    @classmethod
+    def resume_offboard(cls, path: Path, owner: Owner) -> bool:
+        """Finish a durable, owner-verified erasure after interruption."""
+        from . import erasure
+
+        return erasure.resume(Path(path).absolute(), owner)
 
     def fixture_stream(
         self,
@@ -856,7 +1006,11 @@ class QueueState:
             tag = self._mac(b"fixture", identity.encode())
             s = j["sources"].get(channel)
             retired = s["retired"] if s else []
-            if tag in retired:
+            fingerprints = s.get("retired_fingerprints", []) if s else []
+            fingerprint = self._mac(
+                b"sealed-fixture", canonical([tag, size, modification])
+            )
+            if fingerprint in fingerprints or tag in retired:
                 raise QueueError("stale_fixture")
             if s:
                 unchanged = s["size"] == size and s["mtime"] == modification
@@ -869,6 +1023,8 @@ class QueueState:
                         s.update(size=size, mtime=modification)
                         self._save(j)
                     return UUID(s["stream"])
+                if s["sealed"] and s["tag"] == tag and unchanged:
+                    raise QueueError("stale_fixture")
                 if not s["sealed"]:
                     position = j["streams"].get(s["stream"], 0)
                     if channel == "transcript" and position < s["size"]:
@@ -886,6 +1042,12 @@ class QueueState:
                     raise QueueError("source_changed")
                 if tag != s["tag"]:
                     retired.append(s["tag"])
+                else:
+                    fingerprints.append(
+                        self._mac(
+                            b"sealed-fixture", canonical([tag, s["size"], s["mtime"]])
+                        )
+                    )
             stream = uuid4()
             j["sources"][channel] = {
                 "tag": tag,
@@ -895,6 +1057,7 @@ class QueueState:
                 "tail": False,
                 "stream": str(stream),
                 "retired": retired,
+                "retired_fingerprints": fingerprints,
             }
             self._save(j)
             return stream

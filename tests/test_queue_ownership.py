@@ -260,3 +260,141 @@ def test_offboard_recreate_same_owner_cannot_use_old_receipt(tmp_path):
         with pytest.raises(QueueError):
             q.apply_receipt(A, p, json.dumps(receipt(p)).encode())
         assert q.heartbeat(A)["pending"] == 1
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "erase_intent",
+        "erase_manifest",
+        "erase_segment",
+        "erase_database",
+        "erase_detach",
+        "erase_key",
+    ],
+)
+def test_interrupted_offboard_resumes_only_for_bound_owner(tmp_path, cut):
+    path = tmp_path / "queue"
+    with queue(tmp_path, 4):
+        pass
+    script = """
+from test_queue_ownership import A,QueueState
+from pathlib import Path
+import os,sys
+q=QueueState.open(Path(sys.argv[1]),A)
+def crash(name):
+    if name==sys.argv[2]: os._exit(72)
+q._boundary=crash
+q.offboard(A)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path), cut],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+    )
+    assert result.returncode == 72
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+    if cut == "erase_manifest":
+        assert list(path.glob("*.jsonl")) and not (path / "manifest.json").exists()
+    try:
+        assert QueueState.resume_offboard(path, B) is False
+    except QueueError as exc:
+        assert exc.code == "owner_mismatch"
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+    assert QueueState.resume_offboard(path, A)
+    assert not list(tmp_path.iterdir())
+    assert not QueueState.resume_offboard(path, A)
+
+
+def test_offboard_io_failure_retries_after_binding_removed(tmp_path, monkeypatch):
+    path = tmp_path / "queue"
+    with queue(tmp_path, 2) as q:
+        original = Path.unlink
+
+        def fail_segment(self, *args, **kwargs):
+            if self.suffix == ".jsonl":
+                raise OSError("private-name")
+            return original(self, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(Path, "unlink", fail_segment)
+            with pytest.raises(QueueError, match="^blocked_storage$"):
+                q.offboard(A)
+    assert list(path.glob("*.jsonl"))
+    assert QueueState.resume_offboard(path, A) and not path.exists()
+
+
+def test_interrupted_offboard_quarantines_unrecognized_data(tmp_path):
+    with queue(tmp_path, 1) as q:
+
+        def cut(phase):
+            if phase == "erase_manifest":
+                raise OSError()
+
+        q._boundary = cut
+        with pytest.raises(QueueError):
+            q.offboard(A)
+    unknown = tmp_path / "queue" / "00000000000000000990.jsonl"
+    unknown.touch(mode=0o600)
+    originals = {p.name: p.read_bytes() for p in unknown.parent.iterdir()}
+    with pytest.raises(QueueError, match="quarantined"):
+        QueueState.resume_offboard(unknown.parent, A)
+    assert originals == {p.name: p.read_bytes() for p in unknown.parent.iterdir()}
+
+
+def test_offboard_final_window_prevents_recreate_for_same_owner(tmp_path):
+    path = tmp_path / "queue"
+    with queue(tmp_path, 1) as q:
+
+        def cut(phase):
+            if phase == "erase_detach":
+                raise OSError()
+
+        q._boundary = cut
+        with pytest.raises(QueueError):
+            q.offboard(A)
+    with pytest.raises(QueueError, match="offboarding"):
+        QueueState.create(path, A)
+    assert QueueState.resume_offboard(path, A)
+    with QueueState.create(path, A) as q:
+        assert q.next_batch(A) is None
+
+
+def test_resume_offboard_preserves_same_length_corrupt_segment(tmp_path):
+    with queue(tmp_path, 1) as q:
+
+        def cut(phase):
+            if phase == "erase_manifest":
+                raise OSError()
+
+        q._boundary = cut
+        with pytest.raises(QueueError):
+            q.offboard(A)
+    path = tmp_path / "queue"
+    seg = next(path.glob("*.jsonl"))
+    data = bytearray(seg.read_bytes())
+    data[10] ^= 1
+    times = seg.stat()
+    seg.write_bytes(data)
+    os.utime(seg, ns=(times.st_atime_ns, times.st_mtime_ns))
+    with pytest.raises(QueueError, match="quarantined"):
+        QueueState.resume_offboard(path, A)
+    assert seg.read_bytes() == data
+
+
+def test_crash_before_erasure_key_rename_keeps_original_queue(tmp_path):
+    path = tmp_path / "queue"
+    with queue(tmp_path, 1) as q:
+        original = q.next_batch(A)
+
+        def cut(phase):
+            if phase == "erase_prepared":
+                raise OSError()
+
+        q._boundary = cut
+        with pytest.raises(QueueError, match="blocked_storage"):
+            q.offboard(A)
+    assert not QueueState.resume_offboard(path, A)
+    with QueueState.open(path, A) as q:
+        assert q.next_batch(A).rows == original.rows
+        q.offboard(A)
+    assert not path.exists()
