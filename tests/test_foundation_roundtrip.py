@@ -24,9 +24,6 @@ from test_queue_ownership import obs, STREAM
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = os.environ.get("TIDEWALL_SERVER_ROOT")
-pytestmark = pytest.mark.skipif(
-    not SERVER, reason="requires a Tidewall Server checkout and native .venv"
-)
 
 
 # The fixture controls the socket and lifespan only. Every application request
@@ -38,6 +35,8 @@ def serve_fixture():
     import socket
     import sys
     from pathlib import Path
+    from datetime import datetime
+    from app.routes import collector_ingest
     from alembic import command
     from alembic.config import Config
     from app.auth.key_utils import hash_key
@@ -62,6 +61,15 @@ def serve_fixture():
                 key_prefix="fixture",
             )
         )
+    realtime = collector_ingest._now
+    clock = work / "receipt-clock"
+
+    def receipt_time():
+        return (
+            datetime.fromisoformat(clock.read_text()) if clock.exists() else realtime()
+        )
+
+    collector_ingest._now = receipt_time
     app = create_app()
     app.state.session_factory = sessions
     app.state.interaction_log = InteractionLog(sessions)
@@ -91,14 +99,29 @@ def serve_fixture():
                     (work / "confirmed-201").touch()
                     while (work / "pause-201").exists():
                         await asyncio.sleep(0.01)
+                drop = work / (
+                    "drop-heartbeat" if path.endswith("/heartbeat") else "drop"
+                )
                 if (
-                    path.endswith("/observations")
+                    path.endswith(("/observations", "/heartbeat"))
                     and status == 200
-                    and (work / "drop").exists()
+                    and drop.exists()
                 ):
-                    (work / "drop").unlink()
+                    drop.unlink()
                     send.__self__.transport.abort()
                     raise ConnectionResetError("fixture response interruption")
+            if (
+                message["type"] == "http.response.body"
+                and path.endswith("/heartbeat")
+                and status == 200
+                and (work / "stale-ack").exists()
+            ):
+                wrong = json.loads(message["body"])
+                wrong["revision"] -= 1
+                message = {
+                    **message,
+                    "body": json.dumps(wrong, separators=(",", ":")).encode(),
+                }
             if message["type"] == "http.response.body" and status == 403:
                 while (work / "stall-403-body").exists():
                     await asyncio.sleep(0.01)
@@ -134,6 +157,7 @@ def env(root):
         TMPDIR=str(root),
         HF_HUB_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1",
+        TOKENIZERS_PARALLELISM="false",
         PIP_NO_INDEX="1",
         PIP_DISABLE_PIP_VERSION_CHECK="1",
     )
@@ -141,6 +165,8 @@ def env(root):
 
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory):
+    if not SERVER:
+        pytest.skip("requires a Tidewall Server checkout and native .venv")
     root = tmp_path_factory.mktemp("installed").resolve()
     src = root / "src"
     for name in ("src", "vendor"):
@@ -521,6 +547,60 @@ def test_foundation_roundtrip(fleet):
     )
 
 
+def test_installed_heartbeat_replay_and_freshness(fleet):
+    f = fleet
+    a = f.enrol()
+    f.approve(a)
+    now = datetime.now(UTC).replace(microsecond=0)
+    clock = f.root / "receipt-clock"
+
+    def advance(seconds):
+        instant = now + timedelta(seconds=seconds)
+        clock.write_text(instant.isoformat())
+        return instant.replace(tzinfo=None)
+
+    def progress():
+        ((payload, seen, expires),) = f.sql(
+            "select heartbeat_json, heartbeat_received_at, heartbeat_expires_at from collector_progress"
+        )
+        return (
+            json.loads(payload),
+            datetime.fromisoformat(seen),
+            datetime.fromisoformat(expires),
+        )
+
+    t0 = advance(0)
+    (f.root / "drop-heartbeat").touch()
+    lost = f.call("ship", "A", success=False)
+    assert lost.returncode == 75 and lost.stderr.strip() == "offline"
+    first, seen, expires = progress()
+    assert seen == t0 and expires == t0 + timedelta(days=30)
+    for _ in range(2):
+        assert json.loads(f.call("status", "A").stdout)["heartbeat"] == first
+    advance(60)
+    f.call("ship", "A")
+    assert progress() == (first, seen, expires)
+    t2 = advance(120)
+    stale = f.root / "stale-ack"
+    stale.touch()
+    refused = f.call("ship", "A", success=False)
+    assert refused.returncode == 2 and refused.stderr.strip() == "invalid_heartbeat"
+    second, seen, expires = progress()
+    assert second["revision"] > first["revision"]
+    assert {**second, "revision": first["revision"]} == first
+    assert seen == t2 and expires == t2 + timedelta(days=30)
+    stale.unlink()
+    advance(180)
+    f.call("ship", "A")
+    assert progress() == (second, seen, expires)
+    t4 = advance(240)
+    f.call("ship", "A")
+    third, seen, expires = progress()
+    assert third["revision"] > second["revision"]
+    assert {**third, "revision": first["revision"]} == first
+    assert seen == t4 and expires == t4 + timedelta(days=30)
+
+
 def test_same_installation_recovery(fleet):
     f = fleet
     a = f.enrol()
@@ -680,9 +760,21 @@ def test_same_installation_recovery(fleet):
         )[0]
         == 403
     )
+    sources = f.root / "sources"
+    for target in (f.root / "absent-input", sources):
+        refused = f.call("fixture", "B", "--fixture-dir", str(target), success=False)
+        assert refused.returncode == 3 and refused.stderr.strip() == "device_pending"
+        assert f.routes()[-1][2:4] == [f"/v1/devices/{b['device_id']}/refresh", 202]
+    with contextlib.closing(sqlite3.connect(f.root / "B/queue/state.db")) as db:
+        journal = json.loads(db.execute("select payload from journal").fetchone()[0])
+        assert journal["sources"] == journal["streams"] == journal["segments"] == {}
+        assert journal["pending"] == 0 and journal["next_ordinal"] == 1
+        assert not any(journal["totals"].values())
     f.approve(b)
+    f.call("fixture", "B", "--fixture-dir", str(sources))
+    assert f.routes()[-1][2:4] == [f"/v1/devices/{b['device_id']}/refresh", 200]
+    assert json.loads(f.call("status", "B").stdout)["heartbeat"]["pending"] == 11
     check_empty()
-    f.call("ship", "B")
     with QueueState.open(f.root / "A/queue", owner) as q:
         current = q.next_batch(owner)
         assert current is not None and pending is not None
@@ -699,13 +791,14 @@ def test_same_installation_recovery(fleet):
     assert f.sql(
         "select count(*) from agent_observations where device_id=?", b["device_id"]
     ) == [(0,)]
-    assert json.loads(f.call("status", "B").stdout)["heartbeat"]["pending"] == 0
     assert all(route[0] == ["127.0.0.1", f.port] for route in f.routes())
     assert (
         f.request("POST", path + "/refresh", cred["refresh"], {})[1]["reason"]
         == "device_revoked"
     )
+    before = arrivals.read_bytes()
     f.call("fixture", "B", "--fixture-dir", str(f.root / "sources"))
+    assert arrivals.read_bytes() == before
     f.call("ship", "B")
     assert f.sql(
         "select count(*) from agent_observations where device_id=?", b["device_id"]

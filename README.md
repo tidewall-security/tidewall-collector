@@ -22,7 +22,12 @@ and assessment are outside this fixture release.
 ## Install the private wheel
 
 From this checkout, use a Python 3.13 or later build environment containing pip,
-setuptools 77 or later and wheel. These commands create a separate runtime with
+setuptools 77 or later and wheel. The POSIX runtime needs a Python SQLite
+build with `sqlite3.Connection.serialize()` for enrollment and recovery. If the
+CLI reports `sqlite_serialize_required`, use a Python build with that method
+and retry with the same state directory and protected inputs. A fresh command
+checks this capability before it sends the registration or recovery request.
+These commands create a separate runtime with
 only the collector distribution installed.
 
 ```sh
@@ -60,7 +65,16 @@ database migrated to head.
 "$collector" status --state-root "$STATE_A"
 ```
 
+The first fixture pass for a pending device checks its approval with the
+device-bound refresh credential before opening either file. After that refresh
+confirms approval, the same local enrollment can capture its fixture offline.
+
 Each ship pass can acknowledge one batch of up to 32 rows and send a heartbeat.
+The collector journals the entire outgoing heartbeat before transmission. An
+unknown result replays those same bytes across a restart. A verified
+acknowledgment completes that delivery, so a later send with steady counters
+gets a higher revision and a fresh server receipt time. Local `status` shows
+the current queue even when an earlier heartbeat awaits acknowledgment.
 Repeat it while the local heartbeat reports pending rows. An unknown commit or
 retryable failure keeps the original queued metadata for a later pass. Exit 75
 indicates a retryable condition, 3 indicates pending approval and 2 reports an

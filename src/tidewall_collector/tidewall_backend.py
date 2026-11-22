@@ -27,7 +27,7 @@ if __name__ != "__main__":
     from . import admission
     from .initialization import prepare_queue
     from .reader import read_fixture
-    from .state import InvalidHead, Owner, QueueState
+    from .state import InvalidHead, Owner, QueueState, require_sqlite_serialize
 
 
 class BackendError(ValueError):
@@ -545,6 +545,7 @@ class TidewallBackend:
                 return self._finish_setup(state, owner, data)
             if entries != {LOCK}:
                 raise BackendError("state_exists")
+            require_sqlite_serialize()
             request = dict(
                 installation_id=str(installation),
                 device_name="Tidewall fixture collector",
@@ -793,7 +794,7 @@ class TidewallBackend:
             if refreshed:
                 self._refresh(state, owner, data, queue)
             while True:
-                snapshot = queue.heartbeat(owner)
+                snapshot = queue.heartbeat(owner, prepare_delivery=True)
                 status, body = self._post(
                     owner.origin,
                     HEARTBEAT,
@@ -821,12 +822,11 @@ class TidewallBackend:
                 try:
                     if admission.canonical(
                         admission.wire_json(body, 2048)
-                    ) != admission.canonical(expected) or snapshot != queue.heartbeat(
-                        owner
-                    ):
+                    ) != admission.canonical(expected):
                         raise ValueError
                 except ValueError:
                     raise BackendError("invalid_heartbeat") from None
+                queue.complete_heartbeat(owner, snapshot)
                 return
 
     def ingest_fixture(
@@ -837,7 +837,9 @@ class TidewallBackend:
         independent: frozenset[str],
     ) -> None:
         with self._locked() as state:
-            self._queue(state, owner, queue)
+            data = self._queue(state, owner, queue)
+            if data["status"] == "device_pending":
+                self._refresh(state, owner, data, queue)
             read_fixture(directory, owner, queue, independent=independent)
 
     def status(self, owner: Owner, queue: QueueState) -> dict:

@@ -287,6 +287,103 @@ def test_stale_or_command_heartbeat_is_ignored(client):
         assert q.heartbeat(owner) == snapshot
 
 
+def test_unknown_heartbeat_replays_immutable_snapshot_after_local_changes(
+    client, monkeypatch
+):
+    back, owner, q, receiver = client
+    receiver.answers.append(BackendError("offline"))
+    with pytest.raises(BackendError, match="offline"):
+        back.send_heartbeat(owner, q)
+    first = receiver.calls[-1][2]
+    q.admit_record(owner, STREAM, 0, 1, [obs(1)])
+    assert back.status(owner, q)["heartbeat"]["pending"] == 1
+    q.close()
+    assert back.root is not None
+    restarted = TidewallBackend(back.root)
+    monkeypatch.setattr(restarted, "_post", receiver)
+    with QueueState.open(back.root / "queue", owner) as reopened:
+        restarted.send_heartbeat(owner, reopened)
+        assert receiver.calls[-1][2] == first
+        restarted.send_heartbeat(owner, reopened)
+        second = receiver.calls[-1][2]
+        assert second["pending"] == 1 and second["revision"] > first["revision"]
+        restarted.send_heartbeat(owner, reopened)
+        third = receiver.calls[-1][2]
+        assert third["revision"] > second["revision"]
+        assert {**third, "revision": second["revision"]} == second
+
+
+def test_heartbeat_commit_failure_keeps_same_delivery(client, monkeypatch):
+    from tidewall_collector.state import QueueError
+
+    back, owner, q, receiver = client
+    save = q._save
+
+    def no_space(journal):
+        if journal.get("acked_heartbeat"):
+            raise OSError("fixture full disk")
+        save(journal)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(q, "_save", no_space)
+        with pytest.raises(QueueError, match="blocked_storage"):
+            back.send_heartbeat(owner, q)
+    first = receiver.calls[-1][2]
+    q.close()
+    assert back.root is not None
+    with QueueState.open(back.root / "queue", owner) as reopened:
+        back.send_heartbeat(owner, reopened)
+        assert receiver.calls[-1][2] == first
+        # Inspecting live status after a completed ACK must not queue a delivery.
+        assert back.status(owner, reopened)["heartbeat"] == first
+        reopened.admit_record(owner, STREAM, 0, 1, [obs(1)])
+        back.send_heartbeat(owner, reopened)
+        fresh = receiver.calls[-1][2]
+        assert fresh["pending"] == 1 and fresh["revision"] > first["revision"]
+
+
+def disable_sqlite_serialize(patch):
+    import sqlite3
+    from functools import partial
+
+    class WithoutSerialize(sqlite3.Connection):
+        def __getattribute__(self, name):
+            if name == "serialize":
+                raise AttributeError("sensitive_fixture")
+            return super().__getattribute__(name)
+
+    patch.setattr(
+        sqlite3, "connect", partial(sqlite3.connect, factory=WithoutSerialize)
+    )
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_sqlite_capability_before_registration(tmp_path, monkeypatch, recovery):
+    from tidewall_collector.state import QueueError
+
+    root = tmp_path / "device"
+    back = TidewallBackend(root)
+    receiver = Receiver()
+    monkeypatch.setattr(back, "_post", receiver)
+    installation = uuid4()
+
+    def register():
+        if recovery:
+            return back.recover(ORIGIN, installation, REG, "fixture_grant", root)
+        return back.enrol(ORIGIN, REG, root)
+
+    with monkeypatch.context() as patch:
+        disable_sqlite_serialize(patch)
+        with pytest.raises(
+            (QueueError, BackendError), match="^sqlite_serialize_required$"
+        ):
+            register()
+    assert receiver.calls == []
+    assert not (root / "credentials.json").exists()
+    assert register().device_id == DEVICE
+    assert len(receiver.calls) == 1
+
+
 def test_late_reply_cannot_advance_replaced_credentials(client, monkeypatch):
     back, owner, queue, receiver = client
     queue.admit_record(owner, STREAM, 0, 1, [obs(7)])
@@ -592,6 +689,12 @@ def test_new_process_resumes_confirmed_queue_birth(tmp_path, monkeypatch, bounda
 
     if boundary == "first_file":
         assert list((root / "queue").iterdir()) == []
+        # A known remote success may have been created by an earlier release.
+        with monkeypatch.context() as patch:
+            disable_sqlite_serialize(patch)
+            with pytest.raises(state.QueueError, match="^sqlite_serialize_required$"):
+                first.enrol(ORIGIN, REG, root)
+        assert len(receiver.calls) == 1
     else:
         result = invoke("fixture", "--fixture-dir", str(sources))
         assert result.returncode != 0 and result.stderr.strip() == "setup_incomplete"
@@ -615,10 +718,12 @@ def test_new_process_resumes_confirmed_queue_birth(tmp_path, monkeypatch, bounda
         if boundary == "ready_write":
             assert (q.generation, q.projection_key(owner)) == prior
         assert q.heartbeat(owner)["pending"] == 0
+    first.refresh(owner)
+    # Once approval has been confirmed, the separate CLI can capture offline.
     assert invoke("fixture", "--fixture-dir", str(sources)).returncode == 0
     with QueueState.open(root / "queue", owner) as q:
         assert q.heartbeat(owner)["pending"] == 11
-    assert len(receiver.calls) == 1
+    assert len(receiver.calls) == 2
 
 
 def test_unpublished_readiness_never_recreates_lost_initialized_queue(

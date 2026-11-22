@@ -56,7 +56,7 @@ def transcript_inputs(stream=STREAM, *, omit_timestamp=False):
 
     parser = Parser(stream_id=stream)
     omitted = []
-    rows = []
+    rows: list[tuple[int, dict, dict]] = []
     position = 1
     for line, raw in enumerate(
         (FIXTURES / "claude-session.jsonl").read_bytes().splitlines(True), 1
@@ -416,6 +416,7 @@ def test_private_source_data_stays_out_of_wire_logs_and_spool(tmp_path, caplog, 
         ("2024-02-29T18:59:59.12-05:00", "2024-02-29T23:59:59.120000Z"),
         ("2024-02-29T23:59:59Z", "2024-02-29T23:59:59Z"),
         ("2024-02-30T23:59:59Z", None),
+        ("2016-12-31T23:59:60Z", None),
         ("2024-02-29T23:59:59", None),
         ("2024-02-29T23:59:59+01:60", None),
         ("2024-02-29T23:59:59.1234567Z", None),

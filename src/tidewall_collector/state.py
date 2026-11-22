@@ -206,6 +206,26 @@ def _manifest_bytes(owner: Owner, generation: str, location: str, key: bytes) ->
     return canonical([manifest, _tag(key, b"manifest", canonical(manifest))])
 
 
+def require_sqlite_serialize() -> None:
+    # Exercise this optional build capability before consuming a remote grant.
+    try:
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("CREATE TABLE probe(id INTEGER)")
+            _serialize(db)
+    except sqlite3.Error:
+        raise QueueError("blocked_storage") from None
+
+
+def _serialize(db: sqlite3.Connection) -> bytes:
+    serialize = getattr(db, "serialize", None)
+    if not callable(serialize):
+        raise QueueError("sqlite_serialize_required")
+    try:
+        return serialize()
+    except sqlite3.NotSupportedError:
+        raise QueueError("sqlite_serialize_required") from None
+
+
 def _initial_database(generation: str, key: bytes) -> bytes:
     # Prepare the small authenticated empty journal before publishing its file.
     with closing(sqlite3.connect(":memory:")) as db:
@@ -219,7 +239,7 @@ def _initial_database(generation: str, key: bytes) -> bytes:
                 "INSERT INTO journal VALUES (1,?,?)",
                 (payload, _tag(key, b"journal", payload)),
             )
-        return db.serialize()
+        return _serialize(db)
 
 
 def _segment_bounds(j: dict) -> dict[int, list[int]]:
@@ -959,9 +979,11 @@ class QueueState:
             j["flight"] = None
             self._save(j)
 
-    def heartbeat(self, owner: Owner) -> dict:
+    def heartbeat(self, owner: Owner, *, prepare_delivery: bool = False) -> dict:
         with self._operation(owner, recover=False) as j:
             self._inventory(j)
+            if prepare_delivery and j.get("pending_heartbeat") is not None:
+                return j["pending_heartbeat"]
             if (
                 not self._blocked
                 and j["contract"] == admission.CONTRACT
@@ -990,13 +1012,30 @@ class QueueState:
                 "state": status,
             }
             sha = digest(canonical(snapshot))
-            if sha != j["snapshot"]:
+            # Live status can reflect queue changes while an older delivery is
+            # outstanding. Only the sender prepares or completes a delivery.
+            advance = sha != j["snapshot"] or (
+                prepare_delivery and j.get("acked_heartbeat") == j["revision"]
+            )
+            if advance:
                 j["revision"] += 1
                 if j["revision"] > admission.MAX_INT:
                     raise QueueError("blocked_storage")
                 j["snapshot"] = sha
+            snapshot["revision"] = j["revision"]
+            if prepare_delivery:
+                j["pending_heartbeat"] = snapshot
+            if advance or prepare_delivery:
                 self._save(j)
-            return dict(snapshot, revision=j["revision"])
+            return snapshot
+
+    def complete_heartbeat(self, owner: Owner, snapshot: dict) -> None:
+        with self._operation(owner, recover=False) as j:
+            if j.get("pending_heartbeat") != snapshot:
+                raise QueueError("invalid_heartbeat")
+            del j["pending_heartbeat"]
+            j["acked_heartbeat"] = snapshot["revision"]
+            self._save(j)
 
     def offboard(self, owner: Owner) -> None:
         from . import erasure
