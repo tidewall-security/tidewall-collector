@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 # mode. It needs neither the application's import path nor access to its queue.
 if __name__ != "__main__":
     from . import admission
+    from .initialization import prepare_queue
     from .reader import read_fixture
     from .state import InvalidHead, Owner, QueueState
 
@@ -446,7 +447,11 @@ class TidewallBackend:
             raise BackendError("state_unavailable") from None
 
     def _bound(
-        self, state: _LockedState, owner: Owner | None = None
+        self,
+        state: _LockedState,
+        owner: Owner | None = None,
+        *,
+        completing: bool = False,
     ) -> tuple[Owner, dict]:
         data = state.read()
         try:
@@ -464,6 +469,12 @@ class TidewallBackend:
                 raise BackendError("owner_mismatch")
             _secret(data["access"], "at_")
             _secret(data["refresh"], "dr_")
+            if not completing and "setup" in data:
+                if (
+                    not isinstance(data["setup"], dict)
+                    or data["setup"].get("ready") is not True
+                ):
+                    raise BackendError("setup_incomplete")
             if data["status"] not in SUSPENDED | {"active", "device_pending"}:
                 raise BackendError("unsafe_state")
         except (KeyError, TypeError, AttributeError):
@@ -513,7 +524,7 @@ class TidewallBackend:
         with self._locked(create=True) as state:
             entries = set(os.listdir(state.root))
             if CREDENTIALS in entries and entries <= {CREDENTIALS, LOCK, TEMP, "queue"}:
-                owner, data = self._bound(state)
+                owner, data = self._bound(state, completing=True)
                 setup = data.get("setup")
                 if (
                     owner.origin != origin
@@ -563,6 +574,7 @@ class TidewallBackend:
             data["setup"] = dict(
                 code=code,
                 ready=False,
+                birth={"generation": str(uuid4())},
                 proof=self._setup_proof(data, registration, recovery),
             )
             state.write(data)
@@ -590,19 +602,29 @@ class TidewallBackend:
             or type(setup.get("ready")) is not bool
         ):
             raise BackendError("unsafe_state")
-        path = state.path / "queue"
-        if setup["ready"] or os.path.lexists(path):
-            with QueueState.open(path, owner):
-                pass
-        else:
-            with QueueState.create(path, owner):
-                pass
-        if not setup["ready"]:
-            setup["ready"] = True
-            state.write(data)
+        self._complete_queue(state, owner, data)
         self.installation_id = UUID(data["installation_id"])
         self.confirmation_code = code
         return owner
+
+    def _complete_queue(self, state: _LockedState, owner: Owner, data: dict) -> None:
+        setup = data["setup"]
+        path = state.path / "queue"
+        birth = setup.get("birth")
+        if not setup["ready"] and birth is not None:
+            prepare_queue(path, owner, birth, lambda: state.write(data))
+        # Older incomplete handoffs have no proof distinguishing missing state
+        # from unpublished state. They may adopt only their intact bound queue.
+        with QueueState.open(path, owner) as queue:
+            self._check_generation(data, queue)
+            generation = str(queue.generation)
+            if birth is not None and generation != birth["generation"]:
+                raise BackendError("owner_mismatch")
+            if not setup["ready"]:
+                data["queue_generation"] = generation
+                setup["ready"] = True
+                setup.pop("birth", None)
+                state.write(data)
 
     def _check_reply(
         self,
@@ -619,11 +641,19 @@ class TidewallBackend:
                 queue.cancel_flight(owner)
             raise
 
+    @staticmethod
+    def _check_generation(data: dict, queue: QueueState) -> None:
+        if "queue_generation" in data and data["queue_generation"] != str(
+            queue.generation
+        ):
+            raise BackendError("owner_mismatch")
+
     def _refresh(
         self, state: _LockedState, owner: Owner, data: dict, queue: QueueState
     ) -> None:
         if data["status"] in SUSPENDED:
             raise BackendError(data["status"])
+        self._check_generation(data, queue)
         queue.cancel_flight(owner)
         status, body = self._post(
             owner.origin,
@@ -673,6 +703,7 @@ class TidewallBackend:
 
     def _queue(self, state: _LockedState, owner: Owner, queue: QueueState) -> dict:
         _, data = self._bound(state, owner)
+        self._check_generation(data, queue)
         if queue.owner != owner or queue.path != state.path / "queue":
             raise BackendError("owner_mismatch")
         if data["status"] in SUSPENDED:
@@ -812,6 +843,7 @@ class TidewallBackend:
     def status(self, owner: Owner, queue: QueueState) -> dict:
         with self._locked() as state:
             _, data = self._bound(state, owner)
+            self._check_generation(data, queue)
             return dict(
                 device_id=str(owner.device_id),
                 installation_id=data["installation_id"],
@@ -824,6 +856,7 @@ class TidewallBackend:
             _, data = self._bound(state, owner)
             if queue.path != state.path / "queue" or queue.owner != owner:
                 raise BackendError("owner_mismatch")
+            self._check_generation(data, queue)
             queue.set_contract_mismatch(owner, False)
             if data["status"] == "row_too_large":
                 data["status"] = "active"
@@ -831,9 +864,11 @@ class TidewallBackend:
 
     def offboard(self, device_id: UUID) -> None:
         with self._locked() as state:
-            owner, data = self._bound(state)
+            owner, data = self._bound(state, completing=True)
             if owner.device_id != device_id:
                 raise BackendError("owner_mismatch")
+            if "setup" in data and data["setup"].get("ready") is not True:
+                self._complete_queue(state, owner, data)
             queue_path = state.path / "queue"
             resuming = data["status"] == "offboarding"
             if not resuming:
@@ -842,6 +877,7 @@ class TidewallBackend:
             resumed = QueueState.resume_offboard(queue_path, owner)
             if not resumed and (os.path.lexists(queue_path) or not resuming):
                 with QueueState.open(queue_path, owner) as queue:
+                    self._check_generation(data, queue)
                     queue.offboard(owner)
             self._check_reply(state, owner, data)
             if set(os.listdir(state.root)) - {CREDENTIALS, LOCK, TEMP}:

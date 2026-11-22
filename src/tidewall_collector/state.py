@@ -9,7 +9,7 @@ import stat
 import time
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
@@ -192,6 +192,36 @@ def _initial(generation: str) -> dict:
     }
 
 
+def _tag(key: bytes, domain: bytes, data: bytes) -> str:
+    return hmac.digest(key, domain + b"\0" + data, "sha256").hex()
+
+
+def _manifest_bytes(owner: Owner, generation: str, location: str, key: bytes) -> bytes:
+    manifest = dict(
+        origin=owner.origin,
+        device_id=str(owner.device_id),
+        generation=generation,
+        location=location,
+    )
+    return canonical([manifest, _tag(key, b"manifest", canonical(manifest))])
+
+
+def _initial_database(generation: str, key: bytes) -> bytes:
+    # Prepare the small authenticated empty journal before publishing its file.
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.execute(f"PRAGMA page_size={PAGE_BYTES}")
+        db.execute(
+            "CREATE TABLE journal(id INTEGER PRIMARY KEY CHECK(id=1),payload BLOB NOT NULL,tag TEXT NOT NULL)"
+        )
+        payload = canonical(_initial(generation))
+        with db:
+            db.execute(
+                "INSERT INTO journal VALUES (1,?,?)",
+                (payload, _tag(key, b"journal", payload)),
+            )
+        return db.serialize()
+
+
 def _segment_bounds(j: dict) -> dict[int, list[int]]:
     bounds = {int(n): [size, size] for n, size in j["segments"].items()}
     for n, offset, row in (j["intent"] or {}).get("rows", []):
@@ -260,18 +290,14 @@ class QueueState:
             if create:
                 self._key = os.urandom(32)
                 generation = str(uuid4())
-                manifest = {
-                    "origin": owner.origin,
-                    "device_id": str(owner.device_id),
-                    "generation": generation,
-                    "location": self._location,
-                }
                 _create_file(self.path / "key", self._key)
                 _create_file(
                     self.path / "manifest.json",
-                    canonical([manifest, self._mac(b"manifest", canonical(manifest))]),
+                    _manifest_bytes(owner, generation, self._location, self._key),
                 )
-                _create_file(self.path / "state.db", b"")
+                _create_file(
+                    self.path / "state.db", _initial_database(generation, self._key)
+                )
                 sync_directory(self.path)
             self._key = _read(self.path / "key", 32)
             if len(self._key) != 32:
@@ -291,8 +317,6 @@ class QueueState:
                 ):
                     raise QueueError("quarantined")
             self._db = sqlite3.connect(dbpath.as_uri() + "?mode=rw", uri=True)
-            if create:
-                self._db.execute(f"PRAGMA page_size={PAGE_BYTES}")
             if self._db.execute("PRAGMA page_size").fetchone() != (PAGE_BYTES,):
                 raise QueueError("quarantined")
             self._db.execute("PRAGMA secure_delete=ON")
@@ -301,12 +325,6 @@ class QueueState:
             self._db.execute("PRAGMA fullfsync=ON")
             self._db.execute("PRAGMA temp_store=MEMORY")
             self._db.execute(f"PRAGMA max_page_count={DB_PAGES}")
-            if create:
-                self._db.execute(
-                    "CREATE TABLE journal(id INTEGER PRIMARY KEY CHECK(id=1),payload BLOB NOT NULL,tag TEXT NOT NULL)"
-                )
-                self._save(_initial(str(self.generation)))
-                sync_directory(self.path)
             if self._db.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
                 raise QueueError("quarantined")
             self._inventory(self._load())
@@ -343,7 +361,7 @@ class QueueState:
         """Named transaction boundaries used by the crash-recovery harness."""
 
     def _mac(self, domain: bytes, data: bytes) -> str:
-        return hmac.digest(self._key, domain + b"\0" + data, "sha256").hex()
+        return _tag(self._key, domain, data)
 
     def _manifest(self, owner: Owner) -> UUID:
         try:

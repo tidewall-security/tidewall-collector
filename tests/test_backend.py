@@ -478,17 +478,20 @@ def test_known_enrolment_reopens_completed_queue_without_rekey(tmp_path, monkeyp
     receiver = Receiver()
     back = TidewallBackend(root)
     monkeypatch.setattr(back, "_post", receiver)
-    real_create = QueueState.create
+    from tidewall_collector import tidewall_backend as backend
+
+    real_prepare = backend.prepare_queue
     saved = []
 
-    def interrupt(path, owner):
-        with real_create(path, owner) as q:
+    def interrupt(path, owner, birth, persist):
+        real_prepare(path, owner, birth, persist)
+        with QueueState.open(path, owner) as q:
             q.admit_record(owner, STREAM, 0, 1, [obs(50)])
             saved.append((q.generation, q.projection_key(owner), q.next_batch(owner)))
         raise QueueError("busy")
 
     with monkeypatch.context() as patch:
-        patch.setattr(QueueState, "create", interrupt)
+        patch.setattr(backend, "prepare_queue", interrupt)
         with pytest.raises(QueueError, match="busy"):
             back.enrol(ORIGIN, REG, root)
     retry = TidewallBackend(root)
@@ -510,3 +513,255 @@ def test_known_enrolment_reopens_completed_queue_without_rekey(tmp_path, monkeyp
     with pytest.raises((BackendError, QueueError)):
         retry.enrol(ORIGIN, REG, root)
     assert not (root / "queue").exists() and len(receiver.calls) == 1
+
+
+@pytest.mark.parametrize("boundary", ["first_file", "ready_write"])
+def test_new_process_resumes_confirmed_queue_birth(tmp_path, monkeypatch, boundary):
+    """After a known 201 a separate CLI needs only the original local handoff."""
+    import errno
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from tidewall_collector import state, tidewall_backend as backend
+
+    root = tmp_path / "A"
+    sources = tmp_path / "inputs"
+    sources.mkdir()
+    for name in ("claude-session.jsonl", "claude-hooks.json"):
+        shutil.copyfile(Path(__file__).parent / "fixtures" / name, sources / name)
+    receiver = Receiver()
+    first = TidewallBackend(root)
+    monkeypatch.setattr(first, "_post", receiver)
+    save = backend._LockedState.write
+
+    def fail_save(self, data):
+        if (data.get("setup") or {}).get("ready") is True:
+            raise OSError(errno.ENOSPC, "fixture storage interruption")
+        return save(self, data)
+
+    def fail_file(path, data):
+        raise OSError(errno.ENOSPC, "fixture storage interruption")
+
+    with monkeypatch.context() as cut:
+        if boundary == "first_file":
+            cut.setattr(state, "_create_file", fail_file)
+        else:
+            cut.setattr(backend._LockedState, "write", fail_save)
+        with pytest.raises((BackendError, state.QueueError)):
+            first.enrol(ORIGIN, REG, root)
+    owner = state.Owner(ORIGIN, DEVICE)
+    args = [sys.executable, "-m", "tidewall_collector.cli"]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            map(
+                str,
+                [
+                    Path(__file__).resolve().parents[1] / p
+                    for p in (
+                        "src",
+                        "vendor/openaidr/src",
+                        "vendor/openaidr/packages/common/src",
+                    )
+                ],
+            )
+        ),
+    }
+
+    def invoke(command, *extra):
+        with tempfile.TemporaryFile(dir=tmp_path) as fd:
+            fd.write(REG.encode())
+            fd.seek(0)
+            options = (
+                ["--registration-fd", str(fd.fileno()), "--origin", ORIGIN]
+                if command == "enrol"
+                else []
+            )
+            return subprocess.run(
+                [*args, command, "--state-root", str(root), *options, *extra],
+                capture_output=True,
+                text=True,
+                cwd=tmp_path,
+                env=env,
+                pass_fds=[fd.fileno()],
+                timeout=10,
+            )
+
+    if boundary == "first_file":
+        assert list((root / "queue").iterdir()) == []
+    else:
+        result = invoke("fixture", "--fixture-dir", str(sources))
+        assert result.returncode != 0 and result.stderr.strip() == "setup_incomplete"
+        with QueueState.open(root / "queue", owner) as q:
+            assert q.heartbeat(owner)["pending"] == 0
+            prior = (q.generation, q.projection_key(owner))
+            for write in (first.ship_once, first.send_heartbeat):
+                with pytest.raises(BackendError, match="setup_incomplete"):
+                    write(owner, q)
+            with pytest.raises(BackendError, match="setup_incomplete"):
+                first.refresh(owner)
+        (root / "queue").rename(tmp_path / "held")
+        assert invoke("enrol").returncode != 0
+        assert not (root / "queue").exists()
+        (tmp_path / "held").rename(root / "queue")
+    completed = invoke("enrol")
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout)["device_id"] == str(DEVICE)
+    assert json.loads(completed.stdout)["confirmation_code"] == "ABCDEFGH"
+    with QueueState.open(root / "queue", owner) as q:
+        if boundary == "ready_write":
+            assert (q.generation, q.projection_key(owner)) == prior
+        assert q.heartbeat(owner)["pending"] == 0
+    assert invoke("fixture", "--fixture-dir", str(sources)).returncode == 0
+    with QueueState.open(root / "queue", owner) as q:
+        assert q.heartbeat(owner)["pending"] == 11
+    assert len(receiver.calls) == 1
+
+
+def test_unpublished_readiness_never_recreates_lost_initialized_queue(
+    tmp_path, monkeypatch
+):
+    from tidewall_collector import tidewall_backend as backend
+    from tidewall_collector.state import QueueError, Owner
+
+    root = tmp_path / "A"
+    back = TidewallBackend(root)
+    wire = Receiver()
+    monkeypatch.setattr(back, "_post", wire)
+    write = backend._LockedState.write
+
+    def failed_ready(self, data):
+        if data.get("setup", {}).get("ready"):
+            raise OSError("readiness write failed")
+        return write(self, data)
+
+    with monkeypatch.context() as cut:
+        cut.setattr(backend._LockedState, "write", failed_ready)
+        with pytest.raises(BackendError):
+            back.enrol(ORIGIN, REG, root)
+    owner = Owner(ORIGIN, DEVICE)
+    with QueueState.open(root / "queue", owner) as q:
+        # Exercise the lower-level queue separately from the gated CLI.
+        q.admit_record(owner, STREAM, 0, 1, [obs(84)])
+        pending = q.next_batch(owner)
+        key = q.projection_key(owner)
+        generation = q.generation
+    (root / "queue").rename(tmp_path / "held")
+    with pytest.raises((BackendError, QueueError)):
+        back.enrol(ORIGIN, REG, root)
+    assert not (root / "queue").exists() and len(wire.calls) == 1
+    (tmp_path / "held").rename(root / "queue")
+    back.enrol(ORIGIN, REG, root)
+    with QueueState.open(root / "queue", owner) as q:
+        current = q.next_batch(owner)
+        assert current is not None and pending is not None
+        assert q.projection_key(owner) == key and q.generation == generation
+        assert (
+            current.rows == pending.rows
+            and current.expected_cursor == pending.expected_cursor
+        )
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "directory_proof",
+        "partial_key",
+        "partial_manifest",
+        "partial_journal",
+        "prepared_proof",
+        "journal_publish",
+    ],
+)
+def test_interrupted_queue_publication_preserves_planned_generation(
+    tmp_path, monkeypatch, cut
+):
+    import errno
+    from tidewall_collector import state, tidewall_backend as backend
+
+    root = tmp_path / "A"
+    back = TidewallBackend(root)
+    wire = Receiver()
+    monkeypatch.setattr(back, "_post", wire)
+    create = state._create_file
+    write = backend._LockedState.write
+    rename = state.os.rename
+
+    def interrupt():
+        raise OSError(errno.ENOSPC, "fixture storage interruption")
+
+    def partial(path, content):
+        matches = (
+            (cut == "partial_key" and len(content) == 32)
+            or (cut == "partial_manifest" and content.startswith(b"["))
+            or (cut == "partial_journal" and content.startswith(b"SQLite"))
+        )
+        if matches:
+            create(path, content[:7])
+            interrupt()
+        return create(path, content)
+
+    def checkpoint(self, data):
+        plan = data.get("setup", {}).get("birth", {})
+        if (
+            cut == "directory_proof"
+            and "directory" in plan
+            or cut == "prepared_proof"
+            and "prepared" in plan
+        ):
+            interrupt()
+        return write(self, data)
+
+    def publish(source, dest, *args, **kwargs):
+        if (
+            cut == "journal_publish"
+            and str(source).endswith("/initial.db")
+            and str(dest).endswith("/state.db")
+        ):
+            interrupt()
+        return rename(source, dest, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(state, "_create_file", partial)
+        patch.setattr(backend._LockedState, "write", checkpoint)
+        patch.setattr(state.os, "rename", publish)
+        with pytest.raises((state.QueueError, BackendError)):
+            back.enrol(ORIGIN, REG, root)
+    plan = json.loads((root / "credentials.json").read_bytes())["setup"]["birth"]
+    keyfile = root / "queue/key"
+    old_key = keyfile.read_bytes() if keyfile.exists() else None
+    owner = back.enrol(ORIGIN, REG, root)
+    with QueueState.open(root / "queue", owner) as q:
+        assert str(q.generation) == plan["generation"]
+        if old_key is not None:
+            assert q.projection_key(owner) == old_key
+        assert q.heartbeat(owner)["pending"] == 0
+    assert len(wire.calls) == 1
+
+
+def test_explicit_offboard_after_failed_readiness(tmp_path, monkeypatch):
+    from tidewall_collector import tidewall_backend as backend
+
+    root = tmp_path / "A"
+    back = TidewallBackend(root)
+    wire = Receiver()
+    monkeypatch.setattr(back, "_post", wire)
+    write = backend._LockedState.write
+
+    def cut(self, data):
+        if data.get("setup", {}).get("ready"):
+            raise OSError("failed readiness")
+        return write(self, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend._LockedState, "write", cut)
+        with pytest.raises(BackendError):
+            back.enrol(ORIGIN, REG, root)
+    with pytest.raises(BackendError, match="owner_mismatch"):
+        back.offboard(uuid4())
+    back.offboard(DEVICE)
+    assert not (root / "queue").exists() and not (root / "credentials.json").exists()
+    assert back.confirmation_code == "" and len(wire.calls) == 1

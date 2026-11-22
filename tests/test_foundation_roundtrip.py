@@ -889,3 +889,60 @@ def test_completed_scope_refusal_stops_writes(fleet, monkeypatch, operation):
     assert [
         json.loads(line)[1:] for line in arrivals.read_text().splitlines()[before:]
     ] == [["POST", f"/v1/collector/{operation}"]]
+
+
+@pytest.mark.parametrize("cut", ["first_file", "ready_write"])
+def test_installed_cli_finishes_known_enrolment_after_storage_failure(
+    fleet, monkeypatch, cut
+):
+    import errno
+    from tidewall_collector import state, tidewall_backend as backend
+
+    f = fleet
+    root = f.root / "B"
+    registration = f.register()
+    direct = TidewallBackend(root, fixture_loopback=True)
+    write = backend._LockedState.write
+
+    def failed_file(path, data):
+        raise OSError(errno.ENOSPC, "fixture storage interruption")
+
+    def failed_ready(self, data):
+        if data.get("setup", {}).get("ready") is True:
+            raise OSError(errno.ENOSPC, "fixture storage interruption")
+        return write(self, data)
+
+    before = f.root / "arrivals.jsonl"
+    count = len(before.read_text().splitlines())
+    with monkeypatch.context() as patch:
+        if cut == "first_file":
+            patch.setattr(state, "_create_file", failed_file)
+        else:
+            patch.setattr(backend._LockedState, "write", failed_ready)
+        with pytest.raises((backend.BackendError, state.QueueError)):
+            direct.enrol(f.origin, registration, root)
+    arrivals = before.read_bytes()
+    assert len(arrivals.splitlines()) == count + 1
+    assert (
+        f.call(
+            "fixture", "B", "--fixture-dir", str(f.root / "sources"), success=False
+        ).stderr.strip()
+        == "setup_incomplete"
+    )
+    inputs = [("--registration-fd", registration)]
+    if cut == "ready_write":
+        (root / "queue").rename(f.root / "original")
+        assert f.call(
+            "enrol", "B", "--origin", f.origin, secrets=inputs, success=False
+        ).returncode
+        assert not (root / "queue").exists()
+        (f.root / "original").rename(root / "queue")
+    result = f.call("enrol", "B", "--origin", f.origin, secrets=inputs)
+    assert before.read_bytes() == arrivals
+    b = json.loads(result.stdout)
+    f.approve(b)
+    f.call("fixture", "B", "--fixture-dir", str(f.root / "sources"))
+    f.call("ship", "B")
+    assert f.sql(
+        "select count(*) from agent_observations where device_id=?", b["device_id"]
+    ) == [(11,)]

@@ -100,8 +100,11 @@ setup, rerun the same command with the same state root, origin and original
 protected inputs. Keep those inputs until you have received the confirmation
 code. The collector verifies them against the protected local handoff, completes
 queue creation or reopens the existing queue, and returns the original device
-and code without another enrollment request. An initialized queue that goes
-missing or fails integrity checks needs local investigation. The protected
+and code without another enrollment request. During setup, fixture collection,
+refresh and shipping report `setup_incomplete`. The collector records the
+original queue directory and generation before publication. If storage fills
+during preparation, the same command can resume after space becomes available.
+A missing or damaged initialized queue needs local investigation. The protected
 handoff is removed on the first successful refresh.
 
 To explicitly erase A’s local credentials, pseudonym key, queue, checkpoints
