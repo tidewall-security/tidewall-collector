@@ -38,7 +38,8 @@ collector=.fixture-runtime/bin/tidewall-collector
 
 Supply `ORIGIN` as the administrator's HTTPS Tidewall origin. Set `STATE_A` to a
 fresh dedicated state directory under an existing parent, using a canonical
-path with no symlink components. Set `FIXTURE_DIR` to the dedicated two-file
+path with no symlink components. Give each enrollment a disjoint directory.
+A sibling of an existing enrollment is suitable. Set `FIXTURE_DIR` to the dedicated two-file
 directory described below. Use a receiver with the collector routes and its
 database migrated to head.
 
@@ -93,6 +94,15 @@ use B’s state for its own fixture and ship commands.
   --state-root "$STATE_B" --registration-fd 3 --recovery-fd 4 \
   3<"$FRESH_REGISTRATION_FILE" 4<"$RECOVERY_FILE"
 ```
+
+If a confirmed enrollment or recovery reports a busy queue or interrupted local
+setup, rerun the same command with the same state root, origin and original
+protected inputs. Keep those inputs until you have received the confirmation
+code. The collector verifies them against the protected local handoff, completes
+queue creation or reopens the existing queue, and returns the original device
+and code without another enrollment request. An initialized queue that goes
+missing or fails integrity checks needs local investigation. The protected
+handoff is removed on the first successful refresh.
 
 To explicitly erase A’s local credentials, pseudonym key, queue, checkpoints
 and counters, supply its original device UUID. Interrupted erasure can be

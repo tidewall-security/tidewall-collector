@@ -437,3 +437,76 @@ def test_incompatible_heartbeat_holds_pending_observations(client):
     assert q.heartbeat(owner)["state"] == "contract_mismatch"
     back.resume_contract(owner, q)
     assert q.next_batch(owner).rows == original
+
+
+@pytest.mark.parametrize("target", ["queue", "queue/B", "B", "unrelated", "ancestor"])
+def test_disjoint_recovery_state_selection(client, tmp_path, monkeypatch, target):
+    back, owner, q, receiver = client
+    q.admit_record(owner, STREAM, 0, 1, [obs(75)])
+    original = q.next_batch(owner)
+    root = q.path.parent
+    if target == "unrelated":
+        dest = tmp_path / "other"
+        dest.mkdir(mode=0o700)
+        (dest / "preserve").touch()
+    elif target == "ancestor":
+        dest = tmp_path
+    else:
+        dest = root / target
+    before = {p.relative_to(tmp_path) for p in tmp_path.rglob("*")}
+    calls = len(receiver.calls)
+    candidate = TidewallBackend(dest)
+    monkeypatch.setattr(candidate, "_post", receiver)
+    with pytest.raises(BackendError, match="state_exists"):
+        candidate.recover(ORIGIN, uuid4(), REG, "out_of_band", dest)
+    assert {p.relative_to(tmp_path) for p in tmp_path.rglob("*")} == before
+    assert len(receiver.calls) == calls
+    current = q.next_batch(owner)
+    assert (
+        current.rows == original.rows
+        and current.expected_cursor == original.expected_cursor
+    )
+    q.close()
+    back.offboard(owner.device_id)
+    assert not (root / "credentials.json").exists() and not (root / "queue").exists()
+
+
+def test_known_enrolment_reopens_completed_queue_without_rekey(tmp_path, monkeypatch):
+    from tidewall_collector.state import QueueError
+
+    root = tmp_path / "A"
+    receiver = Receiver()
+    back = TidewallBackend(root)
+    monkeypatch.setattr(back, "_post", receiver)
+    real_create = QueueState.create
+    saved = []
+
+    def interrupt(path, owner):
+        with real_create(path, owner) as q:
+            q.admit_record(owner, STREAM, 0, 1, [obs(50)])
+            saved.append((q.generation, q.projection_key(owner), q.next_batch(owner)))
+        raise QueueError("busy")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(QueueState, "create", interrupt)
+        with pytest.raises(QueueError, match="busy"):
+            back.enrol(ORIGIN, REG, root)
+    retry = TidewallBackend(root)
+    monkeypatch.setattr(retry, "_post", receiver)
+    with pytest.raises(BackendError):
+        retry.enrol(ORIGIN, "rt_wrong", root)
+    owner = retry.enrol(ORIGIN, REG, root)
+    assert retry.confirmation_code == "ABCDEFGH" and len(receiver.calls) == 1
+    with QueueState.open(root / "queue", owner) as queue:
+        batch = queue.next_batch(owner)
+        generation, key, previous = saved[0]
+        assert batch is not None and previous is not None
+        assert queue.generation == generation and queue.projection_key(owner) == key
+        assert (
+            batch.rows == previous.rows
+            and batch.expected_cursor == previous.expected_cursor
+        )
+    (root / "queue").rename(tmp_path / "missing")
+    with pytest.raises((BackendError, QueueError)):
+        retry.enrol(ORIGIN, REG, root)
+    assert not (root / "queue").exists() and len(receiver.calls) == 1

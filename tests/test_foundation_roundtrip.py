@@ -82,6 +82,14 @@ def serve_fixture():
             if message["type"] == "http.response.start":
                 status = message["status"]
                 if (
+                    path.endswith("/enrol")
+                    and status == 201
+                    and (work / "pause-201").exists()
+                ):
+                    (work / "confirmed-201").touch()
+                    while (work / "pause-201").exists():
+                        await asyncio.sleep(0.01)
+                if (
                     path.endswith("/observations")
                     and status == 200
                     and (work / "drop").exists()
@@ -89,6 +97,9 @@ def serve_fixture():
                     (work / "drop").unlink()
                     send.__self__.transport.abort()
                     raise ConnectionResetError("fixture response interruption")
+            if message["type"] == "http.response.body" and status == 403:
+                while (work / "stall-403-body").exists():
+                    await asyncio.sleep(0.01)
             if message["type"] == "http.response.body" and not reported:
                 reported = True
                 outcomes = []
@@ -508,7 +519,47 @@ def test_same_installation_recovery(fleet):
     before = arrivals.read_bytes()
     assert f.call("recover", "A", *recover, secrets=inputs, success=False).returncode
     assert arrivals.read_bytes() == before
+    inventory = {p.relative_to(f.root / "A") for p in (f.root / "A").rglob("*")}
+    for target in ("A/queue", "A/queue/B", "A/B"):
+        assert (
+            f.call(
+                "recover", target, *recover, secrets=inputs, success=False
+            ).returncode
+            == 2
+        )
+        assert arrivals.read_bytes() == before
+        assert {
+            p.relative_to(f.root / "A") for p in (f.root / "A").rglob("*")
+        } == inventory
+    from concurrent.futures import ThreadPoolExecutor
+    import fcntl
+
+    (f.root / "pause-201").touch()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        attempt = pool.submit(
+            f.call, "recover", "B", *recover, secrets=inputs, success=False
+        )
+        until = time.monotonic() + 4
+        while not (f.root / "confirmed-201").exists():
+            assert time.monotonic() < until
+            time.sleep(0.01)
+        directory = os.open(f.root / "B", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            (f.root / "pause-201").unlink()
+            busy = attempt.result(timeout=6)
+            assert busy.returncode == 75 and "busy" in busy.stderr
+        finally:
+            os.close(directory)
+    after = arrivals.read_bytes()
+    assert len(after.splitlines()) == len(before.splitlines()) + 1
+    wrong_inputs = [inputs[0], ("--recovery-fd", "wrong_fixture_grant")]
+    assert (
+        f.call("recover", "B", *recover, secrets=wrong_inputs, success=False).returncode
+        == 2
+    )
     result = f.call("recover", "B", *recover, secrets=inputs)
+    assert arrivals.read_bytes() == after
     assert "deletes" in result.stderr and "approval" in result.stderr
     b = json.loads(result.stdout)
     assert (
@@ -580,6 +631,8 @@ def test_same_installation_recovery(fleet):
         "drip_header",
         "drip_body",
         "drip_refusal",
+        "drip_401",
+        "drip_413",
         "short_body",
         "bad_media",
         "large_body",
@@ -628,6 +681,8 @@ def test_real_wire_bounds_and_destination(tmp_path, monkeypatch, fault):
                     codes = {
                         "redirect": b"302 Found",
                         "drip_refusal": b"422 Unprocessable Entity",
+                        "drip_401": b"401 Unauthorized",
+                        "drip_413": b"413 Content Too Large",
                     }
                     status = b"HTTP/1.1 " + codes.get(fault, b"200 OK") + b"\r\n"
                     header = b"Content-Type: application/json\r\n"
@@ -637,7 +692,7 @@ def test_real_wire_bounds_and_destination(tmp_path, monkeypatch, fault):
                         header = b"Content-Type: text/plain\r\n"
                     if fault == "drip_header":
                         peer.sendall(status + b"X-Fixture: ")
-                    elif fault in ("drip_body", "drip_refusal"):
+                    elif fault in ("drip_body", "drip_refusal", "drip_401", "drip_413"):
                         peer.sendall(
                             status
                             + header
@@ -685,6 +740,9 @@ def test_real_wire_bounds_and_destination(tmp_path, monkeypatch, fault):
             )
             if fault == "drip_refusal":
                 assert (status, body) == (422, b"")
+            elif fault in ("drip_401", "drip_413"):
+                assert (status, body) == (int(fault[-3:]), b"")
+                assert time.monotonic() - start < 0.7
             elif fault == "redirect":
                 assert status == 302
             elif fault == "proxy":
@@ -786,3 +844,48 @@ def test_untrusted_tls_certificate_sends_no_http_request(tmp_path, monkeypatch):
             backend._post(origin, "/v1/collector/heartbeat", "at_fixture", b"{}", 2048)
         worker.join(3)
         assert alerts == ["certificate_refused"]
+
+
+@pytest.mark.parametrize("operation", ["observations", "heartbeat"])
+def test_completed_scope_refusal_stops_writes(fleet, monkeypatch, operation):
+    from tidewall_collector import tidewall_backend as backend
+
+    f = fleet
+    a = f.enrol()
+    f.approve(a)
+    owner = Owner(f.origin, UUID(a["device_id"]))
+    client = TidewallBackend(f.root / "A", fixture_loopback=True)
+    client.refresh(owner)
+    # The real middleware refuses a credential with a missing policy binding.
+    # Hold only its response body at the fixture socket, after the final headers.
+    with contextlib.closing(sqlite3.connect(f.root / "fixture.db")) as db, db:
+        db.execute("update devices set policy_id=NULL where id=?", (a["device_id"],))
+    barrier = f.root / "stall-403-body"
+    barrier.touch()
+    arrivals = f.root / "arrivals.jsonl"
+    before = len(arrivals.read_text().splitlines())
+    monkeypatch.setattr(backend, "DEADLINE", 0.8)
+    try:
+        with QueueState.open(f.root / "A/queue", owner) as q:
+            q.admit_record(owner, STREAM, 0, 1, [obs(9)])
+            write = (
+                client.ship_once
+                if operation == "observations"
+                else client.send_heartbeat
+            )
+            start = time.monotonic()
+            with pytest.raises(backend.BackendError, match="scope_denied"):
+                write(owner, q)
+            assert time.monotonic() - start < 0.7
+            assert client.status(owner, q)["status"] == "scope_denied"
+            assert q.heartbeat(owner)["pending"] == 1
+    finally:
+        barrier.unlink()
+    restarted = TidewallBackend(f.root / "A", fixture_loopback=True)
+    with QueueState.open(f.root / "A/queue", owner) as q:
+        for write in (restarted.ship_once, restarted.send_heartbeat):
+            with pytest.raises(backend.BackendError, match="scope_denied"):
+                write(owner, q)
+    assert [
+        json.loads(line)[1:] for line in arrivals.read_text().splitlines()[before:]
+    ] == [["POST", f"/v1/collector/{operation}"]]

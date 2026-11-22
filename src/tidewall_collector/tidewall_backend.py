@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import http.client
+import hmac
 import ipaddress
 import json
 import os
@@ -105,6 +106,10 @@ def canonical_origin(value: str, *, fixture_loopback: bool) -> str:
         raise BackendError("invalid_origin") from None
 
 
+def _write_status_only(path: str, status: int) -> bool:
+    return path in (OBSERVATIONS, HEARTBEAT) and status not in (200, 422)
+
+
 def _wire_worker() -> int:
     """One connection without proxy discovery, redirect handling or retry."""
     try:
@@ -140,6 +145,8 @@ def _wire_worker() -> int:
                 # finishes its bounded refusal body before the parent deadline.
                 sys.stdout.buffer.write(str(status).encode() + b"\n")
                 sys.stdout.buffer.flush()
+                if _write_status_only(path, status):
+                    return 0
                 if status == 422:
                     limit = 128
                 media = response.headers.get_all("Content-Type", [])
@@ -212,19 +219,20 @@ def _post(
         except subprocess.TimeoutExpired:
             worker.kill()
             output, _ = worker.communicate()
-            if output.startswith(b"422\n"):
-                return 422, b""
-            raise BackendError("timeout") from None
-    if output.startswith(b"422\n") and (
-        worker.returncode or time.monotonic() > deadline
-    ):
-        return 422, b""
-    if worker.returncode == 2 or time.monotonic() > deadline:
+            timed_out = True
+        else:
+            timed_out = worker.returncode == 2 or time.monotonic() > deadline
+    header, newline, payload = output.partition(b"\n")
+    status = int(header) if newline and header.isdigit() else 0
+    if status and _write_status_only(path, status):
+        return status, b""
+    if status == 422 and (worker.returncode or timed_out):
+        return status, b""
+    if timed_out:
         raise BackendError("timeout")
-    if worker.returncode:
+    if worker.returncode or not status:
         raise BackendError("offline")
-    status, _, payload = output.partition(b"\n")
-    return int(status), payload
+    return status, payload
 
 
 def _private(fd: int, *, directory: bool = False) -> os.stat_result:
@@ -361,6 +369,54 @@ class TidewallBackend:
         self.installation_id: UUID | None = None
         self._post = _post
 
+    @staticmethod
+    def _reserve(path: Path) -> None:
+        """Publish the root marker only in a suitable, disjoint namespace."""
+
+        def disjoint() -> None:
+            if any(os.path.lexists(parent / LOCK) for parent in path.parents):
+                raise BackendError("state_exists")
+
+        def namespace_lock(fd: int) -> None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BackendError("busy") from None
+
+        disjoint()
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        # A root claim and a competing claim for its direct child both lock
+        # the same directory inode. An existing deeper child already makes
+        # every intervening directory nonempty. These locks end before network I/O or queue operations.
+        with contextlib.ExitStack() as names:
+            parent = os.open(path.parent, directory_flags)
+            names.callback(os.close, parent)
+            namespace_lock(parent)
+            disjoint()
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            root = os.open(path.name, directory_flags, dir_fd=parent)
+            names.callback(os.close, root)
+            _private(root, directory=True)
+            namespace_lock(root)
+            entries = set(os.listdir(root))
+            if LOCK in entries:
+                # An existing binding is authenticated under its own lock.
+                return
+            if entries:
+                raise BackendError("state_exists")
+            fd = os.open(
+                LOCK,
+                os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root,
+            )
+            os.close(fd)
+            os.fsync(root)
+            os.fsync(parent)
+
     @contextlib.contextmanager
     def _locked(self, *, create: bool = False) -> Iterator[_LockedState]:
         path = self.root
@@ -368,15 +424,13 @@ class TidewallBackend:
             raise BackendError("unsafe_state")
         try:
             if create:
-                path.mkdir(mode=0o700, exist_ok=True)
+                self._reserve(path)
             with contextlib.ExitStack() as stack:
                 root = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 stack.callback(os.close, root)
                 _private(root, directory=True)
                 flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_RDWR
-                lock = os.open(
-                    LOCK, flags | (os.O_CREAT if create else 0), 0o600, dir_fd=root
-                )
+                lock = os.open(LOCK, flags, dir_fd=root)
                 stack.callback(os.close, lock)
                 _private(lock)
                 try:
@@ -457,7 +511,28 @@ class TidewallBackend:
             raise BackendError("owner_mismatch")
         self.root = root
         with self._locked(create=True) as state:
-            if set(os.listdir(state.root)) != {LOCK}:
+            entries = set(os.listdir(state.root))
+            if CREDENTIALS in entries and entries <= {CREDENTIALS, LOCK, TEMP, "queue"}:
+                owner, data = self._bound(state)
+                setup = data.get("setup")
+                if (
+                    owner.origin != origin
+                    or data["status"] != "device_pending"
+                    or not isinstance(setup, dict)
+                    or recovery is not None
+                    and str(installation) != data["installation_id"]
+                ):
+                    raise BackendError("state_exists")
+                proof = self._setup_proof(data, registration, recovery)
+                saved = setup.get("proof")
+                if (
+                    not isinstance(saved, str)
+                    or not re.fullmatch("[0-9a-f]{64}", saved)
+                    or not hmac.compare_digest(saved, proof)
+                ):
+                    raise BackendError("state_exists")
+                return self._finish_setup(state, owner, data)
+            if entries != {LOCK}:
                 raise BackendError("state_exists")
             request = dict(
                 installation_id=str(installation),
@@ -474,21 +549,60 @@ class TidewallBackend:
                 raise _failure(status)
             device, access, refresh, code = _device_reply(body, True)
             owner = Owner(origin, device)
-            state.write(
-                dict(
-                    device_id=str(device),
-                    origin=origin,
-                    access=access,
-                    refresh=refresh,
-                    installation_id=str(installation),
-                    status="device_pending",
-                )
+            data = dict(
+                device_id=str(device),
+                origin=origin,
+                access=access,
+                refresh=refresh,
+                installation_id=str(installation),
+                status="device_pending",
             )
-            with QueueState.create(root / "queue", owner):
+            # Preserve a known successful remote transition before attempting
+            # any local queue work. The original protected inputs authorize
+            # redisplay during pending approval, including after process death.
+            data["setup"] = dict(
+                code=code,
+                ready=False,
+                proof=self._setup_proof(data, registration, recovery),
+            )
+            state.write(data)
+            return self._finish_setup(state, owner, data)
+
+    @staticmethod
+    def _setup_proof(data: dict, registration: str, recovery: str | None) -> str:
+        binding = [
+            data["origin"],
+            data["device_id"],
+            data["installation_id"],
+            registration,
+            recovery,
+        ]
+        return hmac.digest(
+            data["refresh"].encode(), admission.canonical(binding), "sha256"
+        ).hex()
+
+    def _finish_setup(self, state: _LockedState, owner: Owner, data: dict) -> Owner:
+        setup = data["setup"]
+        code = setup.get("code")
+        if (
+            not isinstance(code, str)
+            or not re.fullmatch("[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}", code)
+            or type(setup.get("ready")) is not bool
+        ):
+            raise BackendError("unsafe_state")
+        path = state.path / "queue"
+        if setup["ready"] or os.path.lexists(path):
+            with QueueState.open(path, owner):
                 pass
-            self.installation_id = installation
-            self.confirmation_code = code
-            return owner
+        else:
+            with QueueState.create(path, owner):
+                pass
+        if not setup["ready"]:
+            setup["ready"] = True
+            state.write(data)
+        self.installation_id = UUID(data["installation_id"])
+        self.confirmation_code = code
+        return owner
 
     def _check_reply(
         self,
@@ -523,6 +637,7 @@ class TidewallBackend:
             device, access, _, _ = _device_reply(body, False)
             if device != owner.device_id:
                 raise BackendError("owner_mismatch")
+            data.pop("setup", None)
             data.update(access=access, status="active")
             state.write(data)
             return
@@ -543,6 +658,8 @@ class TidewallBackend:
                     raise ValueError
             except (TypeError, ValueError, KeyError):
                 reason = "unauthorized"
+            if reason != "device_pending":
+                data.pop("setup", None)
             data["status"] = reason
             state.write(data)
             raise BackendError(reason)
