@@ -587,3 +587,85 @@ def test_explicit_malformed_gap_keeps_pinned_parser_identity_and_record_domain()
         observation["source"]["record_token"]
         == hmac.digest(KEY, f"parser_record\0{record_id}".encode(), "sha256").hex()
     )
+
+
+@pytest.mark.parametrize(
+    "malformed_fields",
+    [
+        {"name": []},
+        {"input": []},
+        {"caller": []},
+        {"caller": {"type": []}},
+        {
+            "name": "Write",
+            "input": {"file_path": "/synthetic/note", "content": "\ud800"},
+        },
+    ],
+    ids=["name", "input", "caller", "caller-type", "mapper-encoding"],
+)
+def test_malformed_tool_use_preserves_emitted_siblings_and_result_context(
+    malformed_fields,
+):
+    from openaidr.sensor.collectors import Parser
+    from tidewall_collector.projection import project_transcript
+
+    parser = Parser(stream_id=STREAM)
+
+    def project(record, position):
+        return [
+            project_transcript(
+                record, event, stream_id=STREAM, key=KEY, adapter_version=VERSION
+            )
+            for event in parser.parse(record, position=position)
+        ]
+
+    read = {
+        "type": "tool_use",
+        "id": "read",
+        "name": "Read",
+        "input": {"file_path": "/synthetic/note"},
+    }
+    malformed = read | {"id": "malformed"} | malformed_fields
+    fetch = {
+        "type": "tool_use",
+        "id": "fetch",
+        "name": "WebFetch",
+        "input": {"url": "https://synthetic.invalid/note"},
+    }
+    calls = project(
+        {
+            "type": "assistant",
+            "uuid": "calls",
+            "sessionId": "session",
+            "message": {"content": [read, malformed, fetch]},
+        },
+        1,
+    )
+    results = project(
+        {
+            "type": "user",
+            "uuid": "results",
+            "sessionId": "session",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": "synthetic",
+                    }
+                    for call_id in ("read", "fetch", "malformed")
+                ]
+            },
+        },
+        200,
+    )
+
+    assert [row["kind"] for row in calls] == ["session.start", "file.read", "network"]
+    assert [row["source"]["part"] for row in calls] == [0, 1, 2]
+    assert [row["gaps"] for row in calls] == [["malformed_record"]] * 3
+    assert [row["kind"] for row in results] == ["tool.result"] * 3
+    assert [row.get("tool_name") for row in results] == ["Read", "WebFetch", None]
+    assert [row["gaps"] for row in results] == [[], [], ["missing_tool_call"]]
+    assert [row["native_tool_call_token"] for row in calls[1:]] == [
+        row["native_tool_call_token"] for row in results[:2]
+    ]

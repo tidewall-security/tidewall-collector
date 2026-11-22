@@ -20,4 +20,5 @@ The upstream license is retained at vendor/openaidr/LICENSE.
 Tidewall modified src/openaidr/__init__.py to resolve version and provenance
 from the Tidewall package and src/openaidr/sensor/collectors.py to retain only
 the Claude parser, remove host/path and fallback fields, and require an
-explicit stream. These paths are relative to the OpenAIDR extraction root.
+explicit stream. The parser preserves valid sibling observations when a
+tool-use block is malformed. Paths are relative to the OpenAIDR extraction root.

@@ -2,6 +2,7 @@
 
 Tidewall removed discovery, polling, host/path/time hints and other agent
 parsers. The caller supplies an opaque stream ID and source position.
+Malformed tool-use blocks contribute a gap and preserve valid siblings.
 """
 
 import copy
@@ -241,18 +242,33 @@ class Parser:
                 elif text.strip():
                     out.append(dict(e, kind="response", text=text))
             elif typ == "tool_use" and r["type"] == "assistant":
-                e.update(
-                    map_tool(self.product, block.get("name", ""), block.get("input"))[0]
-                )
+                name = block.get("name")
+                arguments = block.get("input")
+                caller = block.get("caller")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or (arguments is not None and not isinstance(arguments, dict))
+                    or (caller is not None and not isinstance(caller, dict))
+                ):
+                    self.record_gaps.append("malformed_record")
+                    continue
+                caller_type = caller.get("type", "") if caller is not None else ""
+                if not isinstance(caller_type, str):
+                    self.record_gaps.append("malformed_record")
+                    continue
+                try:
+                    e.update(map_tool(self.product, name, arguments)[0])
+                except UnicodeError:
+                    self.record_gaps.append("malformed_record")
+                    continue
                 e["tool"] = {
-                    "name": block.get("name", ""),
+                    "name": name,
                     "call_id": block.get("id", ""),
-                    "input": block.get("input"),
+                    "input": arguments,
                     "caller": "subagent"
                     if r.get("isSidechain")
-                    else (block.get("caller") or {})
-                    .get("type", "")
-                    .replace("direct", ""),
+                    else caller_type.replace("direct", ""),
                 }
                 self.remember(native_id(block.get("id")), e)
                 out.append(e)

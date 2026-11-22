@@ -47,8 +47,8 @@
     },
     "src/openaidr/sensor/collectors.py": {
       "upstream_sha256": "d3b44aef9dac7862a527ba2f2d5c327fb1d2d2b49cc406ba543729d86238414e",
-      "redistributed_sha256": "ace293d5e8166dbef17893a6d54fedcbf2d63863b1b78461989f8f8bb940929c",
-      "change": "Retain the Claude parser and evidence helpers. Remove other parsers, polling, discovery, host/path and fallback fields. Require an opaque stream and identify parser-generated record provenance."
+      "redistributed_sha256": "ec4b8cd7f82696b0154756b9ecd7a2023f10d2089a45b6f2ae3933be42c16293",
+      "change": "Retain the Claude parser and evidence helpers. Remove other parsers, polling, discovery, host/path and fallback fields. Require an opaque stream and identify parser-generated record provenance. Keep valid sibling observations and call context when a tool-use block is malformed."
     },
     "src/openaidr/sensor/spool.py": {
       "upstream_sha256": "0318c76986fb05328f32ad750bd82991fcd66406264a6b6f9fe1d8796b811c0c",
