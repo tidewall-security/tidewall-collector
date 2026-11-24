@@ -80,7 +80,7 @@ def _unique(pairs: list[tuple[str, Any]]) -> dict:
     return result
 
 
-def wire_json(data: bytes, limit: int) -> Any:
+def wire_json(data: bytes, limit: int, *, allow_float: bool = False) -> Any:
     require(type(data) is bytes and 0 < len(data) <= limit)
     depth = 0
     quoted = escaped = False
@@ -100,7 +100,7 @@ def wire_json(data: bytes, limit: int) -> Any:
         return json.loads(
             data.decode("utf8"),
             object_pairs_hook=_unique,
-            parse_float=_reject,
+            parse_float=float if allow_float else _reject,
             parse_constant=_reject,
         )
     except (ValueError, RecursionError):

@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import stat
@@ -114,7 +115,15 @@ def _write_status_only(path: str, status: int) -> bool:
 def _wire_worker() -> int:
     """One connection without proxy discovery, redirect handling or retry."""
     try:
-        origin, path, token, body, limit = json.loads(sys.stdin.buffer.read(150000))
+        origin, path, token, body, limit, capability, deadline = json.loads(
+            sys.stdin.buffer.read(150000)
+        )
+        if time.monotonic() >= deadline:
+            return 2
+        if capability:
+            signal.setitimer(
+                signal.ITIMER_REAL, max(0.000001, deadline - time.monotonic())
+            )
         target = urlsplit(origin)
         if target.scheme == "https":
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
@@ -131,13 +140,18 @@ def _wire_worker() -> int:
             conn.request(
                 "POST",
                 path,
-                body.encode("ascii"),
+                body.encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                     "Accept-Encoding": "identity",
                     "Authorization": "Bearer " + token,
                     "Connection": "close",
+                    **(
+                        {"X-Tidewall-Inline-Capability": capability}
+                        if capability
+                        else {}
+                    ),
                 },
             )
             with conn.getresponse() as response:
@@ -148,7 +162,9 @@ def _wire_worker() -> int:
                 sys.stdout.buffer.flush()
                 if _write_status_only(path, status):
                     return 0
-                if status == 422:
+                if capability and status != 200:
+                    limit = 256
+                elif status == 422:
                     limit = 128
                 media = response.headers.get_all("Content-Type", [])
                 encoding = response.headers.get_all("Content-Encoding", [])
@@ -199,13 +215,25 @@ def _wire_worker() -> int:
 
 
 def _post(
-    origin: str, path: str, token: str, body: bytes, limit: int
+    origin: str,
+    path: str,
+    token: str,
+    body: bytes,
+    limit: int,
+    *,
+    capability: str | None = None,
+    deadline: float | None = None,
 ) -> tuple[int, bytes]:
     # libc name resolution and HTTP header parsing may both block beyond an
     # individual socket timeout. Kill/reap the entire single-request child at
     # the wall-clock deadline. Only its private stdin carries credentials.
-    deadline = time.monotonic() + DEADLINE
-    request = json.dumps([origin, path, token, body.decode("ascii"), limit]).encode()
+    if deadline is None:
+        deadline = time.monotonic() + DEADLINE
+    if time.monotonic() >= deadline:
+        raise BackendError("timeout")
+    request = json.dumps(
+        [origin, path, token, body.decode("utf-8"), limit, capability, deadline]
+    ).encode()
     with subprocess.Popen(
         [sys.executable, "-I", "-S", str(Path(__file__).resolve())],
         stdin=subprocess.PIPE,
@@ -222,7 +250,9 @@ def _post(
             output, _ = worker.communicate()
             timed_out = True
         else:
-            timed_out = worker.returncode == 2 or time.monotonic() > deadline
+            timed_out = (
+                worker.returncode in (2, -signal.SIGALRM) or time.monotonic() > deadline
+            )
     header, newline, payload = output.partition(b"\n")
     status = int(header) if newline and header.isdigit() else 0
     if status and _write_status_only(path, status):
@@ -864,6 +894,113 @@ class TidewallBackend:
                 data["status"] = "active"
                 state.write(data)
 
+    def _native_binding(self, auth):
+        from .native_state import CONFIG, NativeState
+
+        if self.root is None:
+            raise BackendError("state_missing")
+        native = NativeState(self, self.root / CONFIG)
+        with native.open(auth.owner, auth.generation) as session:
+            if session.authority() != auth:
+                raise BackendError("stale_authority")
+        return native
+
+    def _native_post(self, auth, path, body, request_type, reply_type, deadline):
+        from datetime import UTC, datetime
+        from . import native_contract as wire
+
+        self._native_binding(auth)
+        lifetime = (
+            datetime.fromisoformat(auth.grant["expires_at"]) - datetime.now(UTC)
+        ).total_seconds()
+        if lifetime <= 0:
+            raise BackendError("grant_expired")
+        deadline = min(deadline, time.monotonic() + lifetime)
+        encoded = wire.encode(body)
+        wire.parse(request_type, encoded)
+        status, raw = self._post(
+            auth.owner.origin,
+            "/v1/native-prompt/" + path,
+            auth.access,
+            encoded,
+            wire.LIMITS.get(reply_type, 2048),
+            capability=auth.grant["capability"],
+            deadline=deadline,
+        )
+        if time.monotonic() >= deadline:
+            raise BackendError("timeout")
+        if status != 200:
+            try:
+                error = wire.parse("NativeRefusal", raw)
+                if error["request_id"] not in (None, body.get("request_id")):
+                    raise ValueError
+            except ValueError:
+                raise BackendError("invalid_reply") from None
+            raise BackendError(error["code"])
+        try:
+            return wire.parse(reply_type, raw)
+        except ValueError:
+            raise BackendError("invalid_reply") from None
+
+    def decide_native(self, auth, request, deadline):
+        from . import native_contract as wire
+
+        if request["observation"]["session_token"] != auth.session_token or (
+            request["input_state"] == "complete"
+            and not (auth.capture and auth.grant["capture_allowed"])
+        ):
+            raise BackendError("stale_authority")
+        reply = self._native_post(
+            auth,
+            "decisions",
+            request,
+            "NativePromptRequest",
+            "NativeDecisionReply",
+            deadline,
+        )
+        wire.bind_decision(reply, request, auth)
+        return reply
+
+    def observe_native(self, auth, metadata, deadline):
+        if metadata["session_token"] != auth.session_token:
+            raise BackendError("stale_authority")
+        ack = self._native_post(
+            auth,
+            "observations",
+            metadata,
+            "NativeMetadata",
+            "NativeObservationAck",
+            deadline,
+        )
+        if ack["occurrence_id"] != metadata[
+            "occurrence_id"
+        ] or auth.selected_session not in (None, ack["session_id"]):
+            raise BackendError("invalid_reply")
+        native = self._native_binding(auth)
+        with native.open(auth.owner, auth.generation) as session:
+            if session.authority() != auth or time.monotonic() >= deadline:
+                raise BackendError("stale_authority")
+            session.select_session(ack["session_id"])
+        if time.monotonic() >= deadline:
+            raise BackendError("timeout")
+        return ack
+
+    def report_native(self, auth, report, deadline):
+        ack = self._native_post(
+            auth,
+            "deliveries",
+            report,
+            "NativeDeliveryReport",
+            "NativeDeliveryAck",
+            deadline,
+        )
+        if (
+            ack["report_id"] != report["report_id"]
+            or ack["decision_id"] != report["decision_id"]
+        ):
+            raise BackendError("invalid_reply")
+        return ack
+
     def offboard(self, device_id: UUID) -> None:
         with self._locked() as state:
             owner, data = self._bound(state, completing=True)
@@ -876,6 +1013,10 @@ class TidewallBackend:
             if not resuming:
                 data["status"] = "offboarding"
                 state.write(data)
+            if "native_state" in data:
+                from .native_state import NativeState
+
+                NativeState.offboard(state, data, owner)
             resumed = QueueState.resume_offboard(queue_path, owner)
             if not resumed and (os.path.lexists(queue_path) or not resuming):
                 with QueueState.open(queue_path, owner) as queue:

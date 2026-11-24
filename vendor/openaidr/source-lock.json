@@ -54,6 +54,14 @@
       "upstream_sha256": "0318c76986fb05328f32ad750bd82991fcd66406264a6b6f9fe1d8796b811c0c",
       "redistributed_sha256": "006f7e5d57ef443e22b5c6d7b4d1bb6c5c78032d88992684c70973a0ec1180ae",
       "change": "Bound JSONL frames and segments; add idempotent positioned append, readback, file and directory fsync. Preserve unread rows for enrollment-owned capacity, cursor, and loss accounting. Reclaim verified prefixes in place with fsynced, replayable chunk copies."
+    },
+    "src/openaidr/guardrail/__init__.py": {
+      "upstream_sha256": "1ddc371d85568838c47f0014f935138d44469158108c1b1d41f2f5762a3e0a83",
+      "redistributed_sha256": "1ddc371d85568838c47f0014f935138d44469158108c1b1d41f2f5762a3e0a83"
+    },
+    "src/openaidr/guardrail/hooks.py": {
+      "upstream_sha256": "77aaaba0045b1d605bbb8e050eb308ed1dd2796a90af8b3d7d7a6616d3e86dbb",
+      "redistributed_sha256": "77aaaba0045b1d605bbb8e050eb308ed1dd2796a90af8b3d7d7a6616d3e86dbb"
     }
   }
 }

@@ -181,7 +181,7 @@ def installed(tmp_path_factory):
     def run(*args):
         subprocess.run(
             args,
-            env=env(root),
+            env={**env(root), "SOURCE_DATE_EPOCH": "315532800"},
             cwd=root,
             check=True,
             stdout=subprocess.DEVNULL,
@@ -489,9 +489,26 @@ def test_foundation_roundtrip(fleet):
     assert {"missing_native_session_id", "malformed_record"} <= gaps
     for table in ("interactions", "interaction_contents", "vaults", "activity_log"):
         assert f.sql(f"select count(*) from {table}") == [(0,)]
-    assert not f.sql(
-        "select name from sqlite_master where type='table' and (name like '%assessment%' or name like '%delivery%')"
-    )
+    # A paired Phase 2 receiver owns these native tables. A fixture-only
+    # run must leave all of them empty, including configuration and grants.
+    native_tables = {
+        name
+        for (name,) in f.sql(
+            "select name from sqlite_master where type='table' and "
+            "(name like 'native_prompt_%' or name like '%assessment%' or name like '%deliver%')"
+        )
+    }
+    if native_tables:
+        assert native_tables == {
+            "native_prompt_policy_configs",
+            "native_prompt_grants",
+            "native_prompt_observations",
+            "native_prompt_decisions",
+            "native_prompt_assessments",
+            "native_prompt_deliveries",
+        }
+        for table in native_tables:
+            assert f.sql("select count(*) from " + table) == [(0,)]
     # A deliberately malformed receiver probe uses the fixture admin harness's
     # direct HTTP client and a synthetic enrolled access token, never ship_once.
     cred = json.loads((f.root / "A/credentials.json").read_bytes())
@@ -609,6 +626,30 @@ def test_same_installation_recovery(fleet):
     f.call("ship", "A")
     owner = Owner(f.origin, UUID(a["device_id"]))
     cred = json.loads((f.root / "A/credentials.json").read_bytes())
+    # Prepare A with a real private native journal and a synthetic protected
+    # capability. Recovery never exposes or transfers A's local artifacts.
+    from test_native_state import grant as synthetic_grant
+
+    prepare = (
+        "--session-config",
+        str(f.root / "A/native-session.json"),
+        "--cwd",
+        str(f.root),
+        "--agent-version",
+        "2.1.330",
+    )
+    sid = ("--session-id-fd", "synthetic-recovery-session")
+    token = json.loads(
+        f.call("prepare-native-session", "A", *prepare, secrets=[sid]).stdout
+    )["session_token"]
+    private_grant = synthetic_grant(owner, token)
+    f.call(
+        "prepare-native-session",
+        "A",
+        *prepare,
+        "--capture",
+        secrets=[sid, ("--grant-fd", json.dumps(private_grant))],
+    )
     # A real semantic conflict commits a rejection without storing new detail.
     request = dict(
         version=1,
@@ -738,6 +779,10 @@ def test_same_installation_recovery(fleet):
     assert "deletes" in result.stderr and "approval" in result.stderr
     b = json.loads(result.stdout)
     assert (
+        not (f.root / "B/native-session.json").exists()
+        and not (f.root / "B/native-journal.json").exists()
+    )
+    assert (
         b["device_id"] != a["device_id"]
         and b["installation_id"] == a["installation_id"]
     )
@@ -811,6 +856,8 @@ def test_same_installation_recovery(fleet):
     assert (
         not (f.root / "A/queue").exists()
         and not (f.root / "A/credentials.json").exists()
+        and not (f.root / "A/native-session.json").exists()
+        and not (f.root / "A/native-journal.json").exists()
     )
 
 

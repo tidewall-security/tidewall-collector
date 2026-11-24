@@ -17,6 +17,9 @@ This product includes selected OpenAIDR source from the public commit
 7ec2891b0904dad621bb13f24312121d05d4ca03 under the Apache License, Version 2.0.
 The upstream license is retained at vendor/openaidr/LICENSE.
 
+The native Claude launcher uses the unmodified public response formatter in
+src/openaidr/guardrail/{__init__,hooks}.py.
+
 Tidewall modified src/openaidr/__init__.py to resolve version and provenance
 from the Tidewall package and src/openaidr/sensor/collectors.py to retain only
 the Claude parser, remove host/path and fallback fields, and require an
