@@ -901,7 +901,7 @@ def collector_provenance(cli, wheel):
         wheel_digest = hashlib.file_digest(stream, "sha256").hexdigest()
     require(
         wheel_digest
-        == "a977cd41dc698e79448665d74ff737ed59dab99c257944bff64517fb08f4b5e4",
+        == "d599ba7d5154d0f0b1e2664cd0b78deb025c7adf0083b898e9acdcdd21527cb8",
         "collector_wheel_mismatch",
     )
     require(

@@ -4,7 +4,26 @@ The demo observes a single synthetic prompt submission with Claude Code 2.1.330,
 
 ## Select the release artifacts
 
-Use Python 3.13 for the Collector. Install the reviewed wheel with `pip install --no-index --no-deps` into a separate pipless virtual environment using another interpreter's `pip --python`. The expected wheel is `tidewall_collector-1.0.0-py3-none-any.whl`, SHA-256 `a977cd41dc698e79448665d74ff737ed59dab99c257944bff64517fb08f4b5e4`. The script verifies all installed Python modules against that wheel, checks the pip launcher’s interpreter path and released entry point, and uses the audited virtual environment’s Python in isolated import mode for every Collector command. Install into its final directory so the launcher’s interpreter path stays valid. Set `COLLECTOR` to that environment's absolute `bin/tidewall-collector` path and `COLLECTOR_WHEEL` to the wheel path. Run the script from this Collector source checkout.
+Build the Collector from commit `f4dedbd506a947ff3ab60259ce702adc4a0f16df` in this checkout. The qualified macOS arm64 build used CPython 3.13.14, pip 26.1.2, setuptools 84.2.1, wheel 0.48.0 and packaging 26.3. Use an existing build environment with those exact versions. The installed runtime contains only the Collector distribution. Run these commands in one shell from the checkout.
+
+```sh
+set -eu
+BUILD_PY="$PWD/.venv/bin/python"
+SOURCE_REV=f4dedbd506a947ff3ab60259ce702adc4a0f16df
+BUILD_ROOT=$(mktemp -d /private/tmp/tw-wheel-XXXXXXXX)
+export SOURCE_DATE_EPOCH=315532800 PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+mkdir "$BUILD_ROOT/src" "$BUILD_ROOT/dist"
+git archive "$SOURCE_REV" | tar -xf - -C "$BUILD_ROOT/src"
+"$BUILD_PY" -c 'from importlib.metadata import version; import sys; assert sys.version_info[:3] == (3,13,14) and [version(p) for p in ("pip","setuptools","wheel","packaging")] == ["26.1.2","84.2.1","0.48.0","26.3"]'
+"$BUILD_PY" -m pip wheel --no-deps --no-cache-dir --no-build-isolation -w "$BUILD_ROOT/dist" "$BUILD_ROOT/src"
+COLLECTOR_WHEEL="$BUILD_ROOT/dist/tidewall_collector-1.0.0-py3-none-any.whl"
+"$BUILD_PY" -m venv --without-pip "$BUILD_ROOT/runtime"
+"$BUILD_PY" -m pip --python "$BUILD_ROOT/runtime/bin/python" install --no-deps --no-index "$COLLECTOR_WHEEL"
+COLLECTOR="$BUILD_ROOT/runtime/bin/tidewall-collector"
+shasum -a 256 "$COLLECTOR_WHEEL"
+```
+
+The wheel SHA-256 is `d599ba7d5154d0f0b1e2664cd0b78deb025c7adf0083b898e9acdcdd21527cb8`. Keep `BUILD_ROOT`, `COLLECTOR` and `COLLECTOR_WHEEL` for the run. The verifier checks the complete pip console script, including a direct `#!` line containing the absolute path to its own runtime’s Python. Use a short, physical final install path with no spaces, as in the recipe. Relocation, shell-trampoline shebangs and alternate console wrappers fall outside this qualification. The helper compares installed module bytes to the wheel and runs the audited interpreter in isolated import mode.
 
 Set `SERVER` to the paired Server checkout, with its dependencies already installed in `.venv`. The harness uses its real migration, authentication, application lifespan, classifier client and decision routes. It seeds an input rule set with generic malicious-prompt detection, threshold 0.5 and report-on-failure. The chosen case sets report mode or adds one access rule for `app_id=claude-code`.
 
@@ -18,6 +37,14 @@ Use the standalone `tidewall-lora-inference==0.1.0a1` wheel from detector commit
 ```
 
 Preparation hashes all 12 manifest files and generates a private tenant and key for this service. The demo checks readiness outside the callback budget. The browser and agent have no classifier credential. Keep the service state private.
+
+## Renew local authority and recover a selection
+
+Run `"$COLLECTOR" refresh --state-root "$STATE_ROOT"` outside the hook to refresh approved device access. Include `--fixture-loopback-http` for the selected loopback receiver. Credentials created before access lifetimes were recorded also need this explicit refresh for native assessment. An expired grant requires an administrator-issued replacement.
+
+After full Server retention expiry, prepare the same selected session in its original working directory with `--new-session` and the usual protected session-ID descriptor. This operation requires the previous grant to have expired. It clears capture consent, the old capability, the selected Server UUID and pending reports. The journal counts discarded rows and unreported outcomes. Import a fresh metadata-only grant, run a metadata-only callback to establish the new Server UUID, then issue and explicitly opt in to capture for that UUID.
+
+When offboard returns `offboard_unverified_native_journal` or `offboard_unverified_native_config`, it has removed independently authenticated native artifacts. The enrollment remains suspended. Inspect the named artifact and any corresponding `.next` entry under the enrollment directory. Move each unverified entry itself to a private location outside enrollment without following symlinks, then rerun offboard with the same device ID. Treat isolated files as potentially sensitive until their owner determines their disposition.
 
 ## Select the native session
 
