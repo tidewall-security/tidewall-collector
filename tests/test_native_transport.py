@@ -9,11 +9,14 @@ import time
 
 import pytest
 import test_foundation_roundtrip
+import test_native_state
 
 from tidewall_collector import native_contract as wire
 from tidewall_collector.tidewall_backend import _post, BackendError
 
+fleet = test_foundation_roundtrip.fleet
 installed = test_foundation_roundtrip.installed
+native = test_native_state.native
 FILES = Path(__file__).parent / "fixtures"
 
 
@@ -502,3 +505,170 @@ def test_observe_native_checks_owner_and_scoped_ack_before_selecting_session(
     )
     with native.open(owner) as session:
         assert session.authority().selected_session == ack["session_id"]
+
+
+@pytest.mark.parametrize("local,remote", [(False, True), (True, False)])
+@pytest.mark.parametrize("kind", ["complete", "unsupported", "input_too_large"])
+def test_public_decision_requires_both_permissions_for_content_states(
+    native, local, remote, kind
+):
+    from test_native_hook import reply
+    from test_native_state import grant
+    from uuid import uuid4
+
+    back, state, owner, token, work = native
+    g = grant(owner, token, capture=remote)
+    state.prepare("synthetic-session", work, "2.1.330", local, g)
+    with state.open(owner) as session:
+        auth = session.authority()
+    sent = []
+
+    def post(origin, path, access, body, limit, **kwargs):
+        request = json.loads(body)
+        sent.append(request["input_state"])
+        return 200, wire.encode(reply(request, g))
+
+    back._post = post
+    meta = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        agent="claude-code",
+        agent_version=wire.VERSION,
+        native_profile=wire.PROFILE,
+        session_token=token,
+    )
+    req = dict(
+        version=1,
+        request_id=str(uuid4()),
+        observation=meta,
+        budget_ms=1000,
+        input_state=kind,
+    )
+    if kind == "complete":
+        req["prompt"] = "synthetic"
+    with pytest.raises(BackendError, match="stale_authority"):
+        back.decide_native(auth, req, time.monotonic() + 1)
+    assert sent == []
+    req.pop("prompt", None)
+    req["input_state"] = "capture_disabled"
+    assert (
+        back.decide_native(auth, req, time.monotonic() + 1)["reason"]
+        == "access_rule_block"
+    )
+    assert sent == ["capture_disabled"]
+
+
+def test_installed_same_session_administrative_policy_regrant(fleet):
+    """Reconfigure a live migrated Server, then install its newer scoped grant."""
+    import sqlite3
+    from contextlib import closing
+    from uuid import uuid4
+    from tidewall_collector.tidewall_backend import TidewallBackend
+    from tidewall_collector.native_state import NativeState
+
+    f = fleet
+    device = f.enrol()
+    f.approve(device)
+    root = f.root / "A"
+    backend = TidewallBackend(root, fixture_loopback=True)
+    owner = backend.owner()
+    backend.refresh(owner)
+    native = NativeState(backend, root / "native-session.json")
+    # The Phase 1 fixture's intentionally bare policy needs an input rule.
+    with closing(sqlite3.connect(f.root / "fixture.db")) as db, db:
+        db.execute(
+            "INSERT INTO rule_sets(id,policy_id,event_type,detectors) VALUES(?,?,?,?)",
+            (
+                str(uuid4()),
+                "fixture-policy",
+                "input",
+                json.dumps({"malicious_prompt": {"action": "block"}}),
+            ),
+        )
+    endpoint = "/v1/policies/fixture-policy/native-prompt"
+
+    def configure(threshold):
+        status, config = f.request(
+            "PUT", endpoint, f.admin, dict(enabled=True, threshold=threshold)
+        )
+        assert status == 200
+        return config["generation"]
+
+    def prepare(g=None, *, capture=False, success=True):
+        secrets = [("--session-id-fd", "synthetic-regrant")]
+        if g:
+            secrets.append(("--grant-fd", json.dumps(g)))
+        return f.call(
+            "prepare-native-session",
+            "A",
+            "--session-config",
+            str(native.path),
+            "--cwd",
+            str(f.root),
+            "--agent-version",
+            wire.VERSION,
+            *(["--capture"] if capture else []),
+            secrets=secrets,
+            success=success,
+        )
+
+    token = json.loads(prepare().stdout)["session_token"]
+
+    def issue(**extra):
+        status, g = f.request(
+            "POST",
+            "/v1/native-prompt/grants",
+            f.admin,
+            dict(
+                device_id=device["device_id"],
+                session_token=token,
+                native_profile=wire.PROFILE,
+                ttl_seconds=300,
+                **extra,
+            ),
+        )
+        assert status == 201
+        return g
+
+    initial_generation = configure(0.5)
+    metadata_grant = issue()
+    prepare(metadata_grant)
+    observation = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        agent="claude-code",
+        agent_version=wire.VERSION,
+        native_profile=wire.PROFILE,
+        session_token=token,
+    )
+
+    def observe():
+        with native.open(owner) as session:
+            auth = session.authority()
+        return backend.observe_native(auth, observation, time.monotonic() + 1.8)
+
+    selected = observe()["session_id"]
+    first = issue(capture_allowed=True, session_id=selected)
+    prepare(first, capture=True)
+    second_generation = configure(0.75)
+    assert second_generation > initial_generation
+    with pytest.raises(BackendError, match="grant_revoked"):
+        observe()
+    new = issue(capture_allowed=True, session_id=selected)
+    assert (
+        new["grant_generation"] > first["grant_generation"]
+        and new["policy_generation"] == second_generation
+    )
+    prepare(new)
+    with native.open(owner) as session:
+        assert not session.authority().capture
+    assert observe()["session_id"] == selected
+    assert (
+        prepare(first, capture=True, success=False).stderr.strip() == "grant_mismatch"
+    )
+    prepare(new, capture=True)
+    with native.open(owner) as session:
+        assert (
+            session.authority().capture
+            and session.authority().grant["grant_id"] == new["grant_id"]
+        )

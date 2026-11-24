@@ -1,6 +1,6 @@
 """POSIX UserPromptSubmit callback. One original budget, one transient attempt."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import os
 import select
 import signal
@@ -174,7 +174,7 @@ def run(stdin, stdout, *, backend, session_config, clock=time.monotonic, started
                 if code not in LOCAL_CODES | {"stdout_failed"}:
                     code = (
                         "storage_unavailable"
-                        if isinstance(exc, (QueueError, OSError))
+                        if isinstance(exc, (QueueError, OSError, BackendError))
                         else "invalid_reply"
                     )
                 if (
@@ -182,7 +182,12 @@ def run(stdin, stdout, *, backend, session_config, clock=time.monotonic, started
                     and code != "stdout_failed"
                     and clock() < transport_end
                 ):
-                    with state.open() as session:
+                    # A lost/corrupt binding can also prevent recording the
+                    # failure. Preserve the original closed diagnostic.
+                    with (
+                        suppress(OSError, ValueError, _Expired),
+                        state.open() as session,
+                    ):
                         session.unavailable(row["request_id"], code)
                 _diagnostic(code)
     except _Expired:

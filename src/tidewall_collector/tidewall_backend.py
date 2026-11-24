@@ -946,7 +946,7 @@ class TidewallBackend:
         from . import native_contract as wire
 
         if request["observation"]["session_token"] != auth.session_token or (
-            request["input_state"] == "complete"
+            request["input_state"] != "capture_disabled"
             and not (auth.capture and auth.grant["capture_allowed"])
         ):
             raise BackendError("stale_authority")

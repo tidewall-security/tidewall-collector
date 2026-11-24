@@ -347,3 +347,64 @@ def test_trickled_stdin_shares_original_deadline(native, monkeypatch):
     thread.join(1)
     with os.fdopen(read_out, "rb") as f:
         assert f.read() == b""
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "native_unprepared",
+        "native_state_invalid",
+        "owner_mismatch",
+        "after_reservation",
+    ],
+)
+def test_local_binding_errors_retain_their_code_without_transport(
+    tmp_path, monkeypatch, capfd, fault
+):
+    from test_backend import Receiver, REG, ORIGIN
+    from tidewall_collector.native_state import NativeState
+    from tidewall_collector.tidewall_backend import TidewallBackend
+
+    root = tmp_path / "active"
+    back = TidewallBackend(root)
+    back._post = Receiver()
+    owner = back.enrol(ORIGIN, REG, root)
+    back.refresh(owner)
+    monkeypatch.chdir(tmp_path)
+    state = NativeState(back, root / "native-session.json")
+
+    def corrupt():
+        tag, body = json.loads(state.path.read_bytes())
+        state.path.write_text(json.dumps(["0" * 64, body]))
+
+    if fault != "native_unprepared":
+        token = state.prepare("synthetic-session", tmp_path, "2.1.330", False, None)
+        state.prepare(
+            "synthetic-session",
+            tmp_path,
+            "2.1.330",
+            False,
+            grant(owner, token, capture=False),
+        )
+        if fault == "native_state_invalid":
+            corrupt()
+        elif fault == "owner_mismatch":
+            with back._locked() as locked:
+                _, data = back._bound(locked)
+                data["queue_generation"] = str(uuid4())
+                locked.write(data)
+        else:
+            read = native_hook._read
+
+            def corrupt_after_read(*args):
+                event = read(*args)
+                corrupt()
+                return event
+
+            monkeypatch.setattr(native_hook, "_read", corrupt_after_read)
+    monkeypatch.setattr(
+        back, "_post", lambda *a, **k: pytest.fail("unexpected HTTP attempt")
+    )
+    assert invoke(back, state, payload(tmp_path, "synthetic")) == b""
+    expected = "native_state_invalid" if fault == "after_reservation" else fault
+    assert capfd.readouterr().err.strip() == expected

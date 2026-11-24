@@ -276,3 +276,49 @@ def test_reporting_never_holds_enrollment_lock_while_reading_or_printing(
     assert cli.main([*argv, "--evidence-fd", "9"]) == 2
     assert cli.main([*argv, "--list"]) == 0
     assert len(checks) == 3
+
+
+@pytest.mark.parametrize("local_observation", [False, True])
+def test_policy_regrant_preserves_session_and_both_generation_fences(
+    native, local_observation
+):
+    _, state, owner, token, work = native
+    old = grant(owner, token)
+    state.prepare("synthetic-session", work, "2.1.330", True, old)
+    if local_observation:
+        with state.open(owner) as session:
+            session.select_session(old["session_id"])
+    newer = dict(
+        old,
+        policy_generation=2,
+        grant_generation=3,
+        grant_id=str(uuid4()),
+        capability="n" * 43,
+    )
+    state.prepare("synthetic-session", work, "2.1.330", False, newer)
+    for supplied in (
+        old,
+        dict(newer, grant_generation=4, policy_generation=1),
+        dict(newer, grant_generation=3, policy_generation=3),
+        dict(newer, grant_generation=4, policy_id="other"),
+        dict(newer, grant_generation=4, session_id=str(uuid4())),
+    ):
+        with pytest.raises(BackendError):
+            state.prepare("synthetic-session", work, "2.1.330", True, supplied)
+    with state.open(owner) as session:
+        assert not session.authority().capture
+        assert session.authority().grant["grant_id"] == newer["grant_id"]
+
+
+@pytest.mark.parametrize(
+    "code", ["owner_mismatch", "native_state_invalid", "native_unprepared"]
+)
+def test_reserved_row_records_local_binding_errors_when_storage_recovers(native, code):
+    _, state, owner, _, _ = native
+    with state.open(owner) as session:
+        request_id = session.reserve_invocation()["request_id"]
+    with state.open(owner) as session:
+        session.unavailable(request_id, code)
+    with state.open(owner) as session:
+        assert session.row(request_id)["outcome"] == code
+        assert session.row(request_id)["reports"] == []

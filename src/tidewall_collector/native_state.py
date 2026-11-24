@@ -320,7 +320,7 @@ class NativeState:
                         and (
                             old["grant_generation"] >= grant["grant_generation"]
                             or old["policy_id"] != grant["policy_id"]
-                            or old["policy_generation"] != grant["policy_generation"]
+                            or old["policy_generation"] > grant["policy_generation"]
                         )
                     ):
                         raise BackendError("grant_mismatch")
@@ -329,7 +329,14 @@ class NativeState:
                         and grant["capture_allowed"]
                         and (bootstrap_required or old and old != grant)
                     ):
-                        if records.get("selected_session") != grant["session_id"]:
+                        # An imported enabled grant already binds the selected
+                        # server session even before its first local callback.
+                        bound_session = old["session_id"] if old else None
+                        selected = records.get("selected_session", bound_session)
+                        if selected != grant["session_id"] or bound_session not in (
+                            None,
+                            selected,
+                        ):
                             raise BackendError("session_mismatch")
             config = dict(
                 version=1,
@@ -585,6 +592,6 @@ LOCAL_CODES = wire.REFUSALS | frozenset(
     (
         "grant_missing native_inactive profile_mismatch session_mismatch cwd_mismatch "
         "unsupported_event invalid_input input_limit timeout busy offline invalid_reply stale_authority "
-        "native_capacity storage_unavailable"
+        "native_capacity storage_unavailable native_unprepared native_state_invalid owner_mismatch"
     ).split()
 )
