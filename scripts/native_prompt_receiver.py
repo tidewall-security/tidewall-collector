@@ -1,6 +1,8 @@
 """Disposable, migrated Tidewall Server for the isolated native acceptance workflow."""
 
 import contextlib
+import errno
+import sys
 import http.client
 import os
 from pathlib import Path
@@ -11,9 +13,21 @@ import threading
 import time
 
 
-def serve():
-    import sys
+def listening_tcp(sock):
+    if sock.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+        return False
+    try:
+        return sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+    except OSError as exc:
+        if sys.platform != "darwin" or exc.errno != errno.ENOPROTOOPT:
+            raise
+        # Darwin exposes SO_ACCEPTCONN but rejects that getsockopt. The public
+        # tcp_connection_info struct begins with tcpi_state; TCPS_LISTEN is 1.
+        info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_CONNECTION_INFO, 256)
+        return info[:1] == bytes([1])
 
+
+def serve():
     # Refuse accidental standalone execution before imports, migrations or seeding.
     root = Path(os.environ.get("HOME", ""))
     db_path = root / "fixture.db"
@@ -31,6 +45,7 @@ def serve():
         with socket.socket(fileno=os.dup(int(sys.argv[1]))) as selected:
             if (
                 selected.family != socket.AF_INET
+                or not listening_tcp(selected)
                 or selected.getsockname()[0] != "127.0.0.1"
             ):
                 raise ValueError
@@ -194,8 +209,11 @@ def receiver(server, root, case, config, classifier_port):
                 if case == "transport-outage":
                     p.terminate()
                     p.wait(timeout=15)
+                    return {"fault": "receiver_stopped", "port": port}
                 elif case == "late-reply":
-                    (root / "delay-native").touch()
+                    (root / "delay-native").touch(exist_ok=False)
+                    return {"fault": "delayed_response", "port": port}
+                return None
 
             yield port, key, fault
         finally:

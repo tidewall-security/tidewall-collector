@@ -208,8 +208,19 @@ def fixture_trace(demo, sid, *, denied=False):
         "usage": dict.fromkeys(demo.COUNTERS, 0 if denied else 1),
     }
     if denied:
-        final["prompt_submit_outcome"] = {"kind": "blocked_by_hook"}
-        return [init, final]
+        ack = {
+            "type": "system",
+            "subtype": "informational",
+            "uuid": str(uuid4()),
+            "session_id": sid,
+            "prevent_continuation": True,
+            "prompt_submit_outcome": {
+                "kind": "blocked_by_hook",
+                "prompt_kept": False,
+                "reason": "Blocked by Tidewall policy",
+            },
+        }
+        return [init, ack, final]
     tool = {
         "type": "tool_use",
         "id": "marker-tool",
@@ -240,7 +251,13 @@ def framed(demo, events, sid, marker):
     }
     events[1:1] = [
         {**hook, "subtype": "hook_started"},
-        {**hook, "subtype": "hook_response"},
+        {
+            **hook,
+            "subtype": "hook_response",
+            "stdout": demo.BLOCK.decode()
+            if any("prompt_submit_outcome" in e for e in events)
+            else "",
+        },
     ]
     return b"\n".join(demo.compact(e) for e in events)
 
@@ -268,7 +285,7 @@ def test_native_negative_trace_requires_complete_correlated_receipts(tmp_path, c
     if change == "missing-counter":
         final["usage"].pop("input_tokens")
     if change == "missing-ack":
-        final.pop("prompt_submit_outcome")
+        events.pop(1)
     if change == "extra-tool":
         events.insert(1, fixture_trace(demo, sid)[1])
     if change == "marker":
@@ -350,22 +367,328 @@ def test_ambiguous_trace_cannot_establish_observed_effect(tmp_path):
     assert not demo.trace(framed(demo, events, sid, marker), sid, marker)["positive"]
 
 
-def test_receiver_refuses_existing_or_unselected_state_before_any_server_import(
-    tmp_path,
+@pytest.mark.parametrize(
+    "change",
+    [
+        "sessionless",
+        "wrong-type",
+        "wrong-subtype",
+        "after-final",
+        "not-prevented",
+        "kept",
+        "dangling-marker",
+        "wrong-reason",
+        "no-hook-session",
+    ],
+)
+def test_review_ack_and_marker_require_attribution(tmp_path, change):
+    demo = load_demo()
+    sid = str(uuid4())
+    marker = tmp_path / demo.MARKER
+    events = fixture_trace(demo, sid, denied=True)
+    ack = events[1]
+    if change == "sessionless":
+        ack.pop("session_id")
+    if change == "wrong-type":
+        ack["type"] = "unrelated"
+    if change == "wrong-subtype":
+        ack["subtype"] = "other"
+    if change == "after-final":
+        events[1:] = events[:0:-1]
+    if change == "not-prevented":
+        ack["prevent_continuation"] = False
+    if change == "kept":
+        ack["prompt_submit_outcome"]["prompt_kept"] = True
+    if change == "dangling-marker":
+        marker.symlink_to(tmp_path / "missing")
+    if change == "wrong-reason":
+        ack["prompt_submit_outcome"]["reason"] = "unrelated"
+    records = [
+        json.loads(line) for line in framed(demo, events, sid, marker).splitlines()
+    ]
+    if change == "no-hook-session":
+        records[1].pop("session_id")
+    try:
+        result = demo.trace(b"\n".join(demo.compact(r) for r in records), sid, marker)
+    except demo.QualificationError:
+        return
+    assert not result["blocked"]
+
+
+@pytest.mark.parametrize(
+    "call_id,content,error",
+    [
+        (1, "", False),
+        (" ", "", False),
+        ("tool", None, False),
+        ("tool", {}, False),
+        ("tool", 17, False),
+        ("tool", [], False),
+        ("tool", "", None),
+        ("tool", "", 0),
+        ("tool", "", ""),
+    ],
+)
+def test_review_incomplete_native_tool_receipt(tmp_path, call_id, content, error):
+    demo = load_demo()
+    sid = str(uuid4())
+    marker = tmp_path / demo.MARKER
+    marker.touch()
+    events = fixture_trace(demo, sid)
+    events[1]["message"]["content"][0]["id"] = call_id
+    events[2]["message"]["content"][0].update(
+        tool_use_id=call_id, content=content, is_error=error
+    )
+    assert not demo.trace(framed(demo, events, sid, marker), sid, marker)["positive"]
+
+
+@pytest.mark.parametrize("paired", ["transport-outage"], indirect=True)
+@pytest.mark.parametrize(
+    "mutation", ["local-refusal", "unknown", "stale-revision", "duplicate-identity"]
+)
+def test_review_outage_rejects_unrelated_fallback_with_marker(
+    paired, monkeypatch, mutation
 ):
+    demo, case, fleet, _, fault = paired
+
+    original = demo.command
+
+    def observed(args, work, **kwargs):
+        r = original(args, work, **kwargs)
+        if "--list" in args:
+            j = json.loads(r.stdout)
+            if len(j["rows"]) == 2:
+                before, after = j["rows"]
+                if mutation == "local-refusal":
+                    after["outcome"] = "cwd_mismatch"
+                if mutation == "unknown":
+                    after["outcome"] = "reserved_unknown"
+                if mutation == "stale-revision":
+                    after["revision"] = before["revision"]
+                if mutation == "duplicate-identity":
+                    after["occurrence_id"] = before["occurrence_id"]
+                r.stdout = demo.compact(j)
+        return r
+
+    def simulated_agent(binary, context, work, sid, text, args, receipt, selection):
+        r = original(
+            args,
+            work,
+            data=demo.compact(
+                dict(
+                    hook_event_name="UserPromptSubmit",
+                    cwd=str(work),
+                    session_id=sid,
+                    prompt=text,
+                )
+            ),
+        )
+        assert r.stdout == b""
+        (work / demo.MARKER).touch()
+        return "allow_no_output", dict(
+            positive=True,
+            blocked=False,
+            tool_count=1,
+            marker_present=True,
+            token_count=4,
+        )
+
+    monkeypatch.setattr(demo, "command", observed)
+    monkeypatch.setattr(demo, "agent_run", simulated_agent)
+    with pytest.raises(demo.QualificationError):
+        demo.run_case(
+            fleet.root,
+            fleet.cli,
+            fleet.port,
+            fleet.admin,
+            "fixture-policy",
+            case,
+            binary="fixture",
+            before_submit=fault,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "duplicate",
+        "wrong-source",
+        "wrong-count",
+        "wrong-effect",
+        "swapped-effect",
+        "bool-count",
+    ],
+)
+def test_review_delivery_verifies_all_observed_stages(mutation):
+    demo = load_demo()
+    effects = {"marker_present": False, "token_count": 0, "tool_count": 0}
+    expected = [
+        ("stdout_flushed", {}),
+        ("native_ack_blocked", {}),
+        ("effect_deny_no_effect_verified", effects),
+    ]
+    rows = [
+        dict(
+            evidence_source="controlled_observer",
+            stage=stage,
+            report_count=1,
+            received_at="2026-11-24T12:00:00Z",
+            **{k: fields.get(k) for k in effects},
+        )
+        for stage, fields in expected
+    ]
+    demo.verify_delivery(rows, expected)
+    if mutation == "missing":
+        rows.pop()
+    if mutation == "duplicate":
+        rows.append(rows[1])
+    if mutation == "wrong-source":
+        rows[0]["evidence_source"] = "hook"
+    if mutation == "wrong-count":
+        rows[0]["report_count"] = 2
+    if mutation == "wrong-effect":
+        rows[2]["marker_present"] = True
+    if mutation == "swapped-effect":
+        rows[0]["stage"], rows[2]["stage"] = rows[2]["stage"], rows[0]["stage"]
+    if mutation == "bool-count":
+        rows[2]["tool_count"] = False
+    with pytest.raises(demo.QualificationError):
+        demo.verify_delivery(rows, expected)
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "wrong-tmpdir",
+        "wrong-db-url",
+        "wrong-mode",
+        "wrong-argc",
+        "invalid-fd",
+        "udp",
+        "bound-stream",
+        "existing-db",
+    ],
+)
+def test_review_receiver_preconditions_independently(tmp_path, guard):
+    import socket
     import subprocess
     import sys
 
+    root = tmp_path.resolve()
+    root.chmod(0o700)
+    db = root / "fixture.db"
     helper = ROOT / "scripts/native_prompt_receiver.py"
-    existing = tmp_path / "fixture.db"
-    existing.write_bytes(b"owned-test-sentinel")
-    for argv in ([], ["9999", "benign"]):
+    env = {"HOME": str(root), "TMPDIR": str(root), "DB_URL": "sqlite:///" + str(db)}
+    with socket.socket(
+        type=socket.SOCK_DGRAM if guard == "udp" else socket.SOCK_STREAM
+    ) as sock:
+        sock.bind(("127.0.0.1", 0))
+        if guard not in ("udp", "bound-stream"):
+            sock.listen()
+        args = [str(sock.fileno()), "benign"]
+        if guard == "wrong-tmpdir":
+            env["TMPDIR"] = "/tmp"
+        if guard == "wrong-db-url":
+            env["DB_URL"] = "sqlite:///" + str(root / "other.db")
+        if guard == "wrong-mode":
+            root.chmod(0o755)
+        if guard == "wrong-argc":
+            args = []
+        if guard == "invalid-fd":
+            args[0] = "9999"
+        if guard == "existing-db":
+            db.write_bytes(b"owned-test-sentinel")
         run = subprocess.run(
-            [sys.executable, "-I", helper, *argv],
-            cwd=tmp_path,
+            [sys.executable, "-I", helper, *args],
+            cwd=root,
+            env=env,
+            pass_fds=[sock.fileno()],
             stdin=subprocess.DEVNULL,
-            env={"HOME": str(tmp_path), "DB_URL": "sqlite:///" + str(existing)},
             capture_output=True,
         )
-        assert run.returncode and run.stderr == b"isolated_receiver_required\n"
-        assert existing.read_bytes() == b"owned-test-sentinel"
+    assert run.returncode and run.stderr == b"isolated_receiver_required\n"
+    if guard == "existing-db":
+        assert db.read_bytes() == b"owned-test-sentinel"
+    else:
+        assert not db.exists()
+
+
+def test_review_relocated_actual_launcher_rejected_before_server(tmp_path, installed):  # noqa: F811
+    import shutil
+
+    demo = load_demo()
+    # Copy a real pipless runtime. Its Python sees only its own installed modules,
+    # while pip's launcher keeps the old absolute shebang.
+    dest = tmp_path / "relocated"
+    shutil.copytree(installed.parents[1], dest, symlinks=True)
+    wheel = next(installed.parents[2].glob("*.whl"))
+    with pytest.raises(demo.QualificationError, match="launcher"):
+        demo.collector_provenance(dest / "bin/tidewall-collector", wheel)
+
+
+@pytest.mark.parametrize("paired", ["denied"], indirect=True)
+def test_review_submitted_delivery_ack_cannot_substitute_for_readback(
+    paired, monkeypatch
+):
+    demo, case, fleet, _, fault = paired
+    original_get = demo.get
+
+    def simulated_agent(binary, context, work, sid, text, args, receipt, selection):
+        result = demo.command(
+            args,
+            work,
+            data=demo.compact(
+                dict(
+                    hook_event_name="UserPromptSubmit",
+                    cwd=str(work),
+                    session_id=sid,
+                    prompt=text,
+                )
+            ),
+        )
+        if result.stdout == demo.BLOCK:
+            return "stdout_flushed", dict(
+                blocked=True,
+                positive=False,
+                marker_present=False,
+                token_count=0,
+                tool_count=0,
+            )
+        assert result.stdout == b""
+        (work / demo.MARKER).touch()
+        return "allow_no_output", dict(
+            blocked=False,
+            positive=True,
+            marker_present=True,
+            token_count=4,
+            tool_count=1,
+        )
+
+    omitted = []
+
+    def omit_committed_stage(*args):
+        response = original_get(*args)
+        if isinstance(response, dict) and "items" in response:
+            for item in response["items"]:
+                reports = item["decision"]["delivery_reports"]
+                if len(reports) == 3:
+                    omitted.append(reports.pop()["stage"])
+        return response
+
+    monkeypatch.setattr(demo, "agent_run", simulated_agent)
+    monkeypatch.setattr(demo, "get", omit_committed_stage)
+    with pytest.raises(demo.QualificationError, match="delivery_readback_mismatch"):
+        demo.run_case(
+            fleet.root,
+            fleet.cli,
+            fleet.port,
+            fleet.admin,
+            "fixture-policy",
+            case,
+            binary="fixture",
+            before_submit=fault,
+        )
+    assert len(omitted) == 1 and fleet.sql(
+        "select count(*) from native_prompt_deliveries"
+    ) == [(3,)]

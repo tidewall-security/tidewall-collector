@@ -258,13 +258,30 @@ def agent_run(binary, context, work, sid, prompt, args, receipt, selection):
     return receipt.read_text(), trace(r.stdout, sid, marker)
 
 
+def valid_tool_result(result):
+    if "is_error" in result and result["is_error"] is not False:
+        return False
+    content = result.get("content")
+    if isinstance(content, str):
+        return True
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(part, dict)
+            and set(part) == {"type", "text"}
+            and part["type"] == "text"
+            and isinstance(part["text"], str)
+            for part in content
+        )
+    )
+
+
 def trace(raw, sid, marker):
     events = [json.loads(line) for line in raw.splitlines() if line.strip()]
     require(
         events
-        and all(
-            isinstance(e, dict) and e.get("session_id", sid) == sid for e in events
-        ),
+        and all(isinstance(e, dict) and e.get("session_id") == sid for e in events),
         "unmatched_trace",
     )
     inits = [
@@ -290,7 +307,10 @@ def trace(raw, sid, marker):
         if e.get("subtype") in ("hook_started", "hook_progress", "hook_response")
     ]
     require(
-        all(e.get("hook_event") == "UserPromptSubmit" for e in hook_events),
+        all(
+            e.get("type") == "system" and e.get("hook_event") == "UserPromptSubmit"
+            for e in hook_events
+        ),
         "unexpected_agent_hook",
     )
     starts = [e for e in hook_events if e["subtype"] == "hook_started"]
@@ -299,7 +319,7 @@ def trace(raw, sid, marker):
         len(starts) == len(ends) == 1
         and isinstance(starts[0].get("hook_id"), str)
         and bool(starts[0]["hook_id"])
-        and ends[0].get("hook_id") == starts[0]["hook_id"]
+        and all(e.get("hook_id") == starts[0]["hook_id"] for e in hook_events)
         and events.index(starts[0]) < events.index(ends[0]),
         "unverified_hook_environment",
     )
@@ -327,41 +347,55 @@ def trace(raw, sid, marker):
             blocks.append(block)
     tools = [b for b in blocks if b.get("type") == "tool_use"]
     results = [b for b in blocks if b.get("type") == "tool_result"]
-    acks = [
-        e["prompt_submit_outcome"].get("kind")
-        for e in events
-        if "prompt_submit_outcome" in e
-    ]
+    acks = [e for e in events if "prompt_submit_outcome" in e]
+    # One native process receives one prompt. Bind the explicit informational
+    # acknowledgement to that session, after its unique UserPromptSubmit response.
+    ack = acks[0] if len(acks) == 1 else {}
+    outcome = ack.get("prompt_submit_outcome")
+    ack_blocked = (
+        ack.get("type") == "system"
+        and ack.get("subtype") == "informational"
+        and ack.get("session_id") == sid
+        and ack.get("prevent_continuation") is True
+        and ends[0].get("stdout") in (BLOCK.decode(), BLOCK.decode().rstrip("\n"))
+        and isinstance(outcome, dict)
+        and outcome.get("kind") == "blocked_by_hook"
+        and outcome.get("prompt_kept") is False
+        and outcome.get("reason") == "Blocked by Tidewall policy"
+        and events.index(ends[0]) < events.index(ack) < events.index(final)
+    )
+
     uses = final.get("usage", {})
     counts = [uses.get(k) for k in COUNTERS]
     require(all(type(n) is int and n >= 0 for n in counts), "incomplete_usage")
-    present = marker.exists()
-    if present:
-        require(
-            marker.is_file() and not marker.is_symlink() and marker.stat().st_size == 0,
-            "unexpected_marker",
-        )
+    try:
+        entry = marker.lstat()
+    except FileNotFoundError:
+        present = False
+    else:
+        present = True
+        require(stat.S_ISREG(entry.st_mode) and entry.st_size == 0, "unexpected_marker")
     positive = (
-        "blocked_by_hook" not in acks
+        all(
+            isinstance(e["prompt_submit_outcome"], dict)
+            and e["prompt_submit_outcome"].get("kind") != "blocked_by_hook"
+            for e in acks
+        )
         and len(tools) == len(results) == 1
         and tools[0].get("name") == "Bash"
         and tools[0].get("input", {}).get("command") == COMMAND
         and set(tools[0].get("input", {})) <= {"command", "description", "timeout"}
-        and bool(tools[0].get("id"))
+        and isinstance(tools[0].get("id"), str)
+        and bool(tools[0]["id"].strip())
         and blocks.index(tools[0]) < blocks.index(results[0])
-        and "content" in results[0]
+        and valid_tool_result(results[0])
         and results[0].get("tool_use_id") == tools[0]["id"]
-        and not results[0].get("is_error")
         and final.get("subtype") == "success"
         and final.get("is_error") is False
         and present
     )
     blocked = (
-        acks == ["blocked_by_hook"]
-        and not tools
-        and not results
-        and not present
-        and counts == [0] * 4
+        ack_blocked and not tools and not results and not present and counts == [0] * 4
     )
     return dict(
         positive=positive,
@@ -375,6 +409,45 @@ def trace(raw, sid, marker):
         ),
         effective_hooks=["UserPromptSubmit"],
     )
+
+
+def verify_delivery(rows, reports):
+    """Compare persisted, grouped observations after all reporter acknowledgements."""
+    expected = []
+    for stage, fields in reports:
+        expected.append(
+            dict(
+                stage=stage,
+                evidence_source="controlled_observer",
+                report_count=1,
+                **{
+                    key: fields.get(key)
+                    for key in ("tool_count", "token_count", "marker_present")
+                },
+            )
+        )
+
+    # Canonical JSON preserves the difference between booleans and integers.
+    def normalized(items):
+        return sorted(json.dumps(item, sort_keys=True) for item in items)
+
+    observed = [{k: v for k, v in row.items() if k != "received_at"} for row in rows]
+    require(normalized(observed) == normalized(expected), "delivery_readback_mismatch")
+
+
+# The installed NativeState reader authenticates the selected revision. Return
+# only its identifiers/consent; neither the capability nor access bearer leaves it.
+READ_BINDING = """from pathlib import Path
+import json,sys
+from tidewall_collector.native_state import NativeState
+from tidewall_collector.tidewall_backend import TidewallBackend
+root=Path(sys.argv[1])
+with NativeState(TidewallBackend(root,fixture_loopback=True),root/'native-session.json').open() as session:
+    auth=session.authority()
+    print(json.dumps(dict(revision=auth.revision, generation=str(auth.generation),
+        session=auth.selected_session, grant=auth.grant['grant_id'], grant_generation=auth.grant['grant_generation'],
+        capture=auth.capture)))
+"""
 
 
 def run_case(
@@ -394,10 +467,11 @@ def run_case(
     work.mkdir(mode=0o700)
     state = root / "enrollment"
     sid = str(uuid4())
+    entry = collector_entry(cli)
 
     def call(name, *extra, secrets=()):
         args = [
-            str(cli),
+            *entry,
             name,
             "--state-root",
             str(state),
@@ -474,7 +548,7 @@ def run_case(
 
     def invoke(text, name):
         args = [
-            str(cli),
+            *entry,
             "claude-hook",
             "--state-root",
             str(state),
@@ -559,12 +633,55 @@ def run_case(
         (work / MARKER).unlink()
     grant = issue(capture_allowed=True, session_id=selected)
     prepare(grant, capture=case != "disabled")
-    if before_submit:
-        before_submit()
-    stage, native = invoke(prompts(case), "assessment")
-    rows = journal()["rows"]
+
+    def binding():
+        return json.loads(
+            command(
+                [cli.parent / "python", "-I", "-c", READ_BINDING, str(state)], work
+            ).stdout
+        )
+
+    active = binding()
     require(
-        len(rows) == 2 and rows[0]["request_id"] == first["rows"][0]["request_id"],
+        active["session"] == selected
+        and active["grant"] == grant["grant_id"]
+        and active["grant_generation"] == grant["grant_generation"]
+        and active["capture"] is (case != "disabled")
+        and active["generation"] == generation
+        and active["revision"] != first["rows"][0]["revision"],
+        "capture_grant_binding_mismatch",
+    )
+    before = journal()
+    require(
+        before["rows"] == first["rows"] and before["selected_session"] == selected,
+        "unexpected_prior_callback",
+    )
+    fault = before_submit() if before_submit else None
+    if case in ("transport-outage", "late-reply"):
+        expected_fault = (
+            "receiver_stopped" if case == "transport-outage" else "delayed_response"
+        )
+        require(
+            fault == {"fault": expected_fault, "port": port},
+            "controlled_fault_unverified",
+        )
+    stage, native = invoke(prompts(case), "assessment")
+    after = journal()
+    require(
+        binding() == active and after["selected_session"] == selected,
+        "capture_grant_binding_changed",
+    )
+    rows = after["rows"]
+    require(
+        len(rows) == 2
+        and rows[:-1] == before["rows"]
+        and rows[-1]["revision"] == active["revision"]
+        and all(
+            isinstance(rows[-1].get(k), str)
+            and UUID(rows[-1][k]).version == 4
+            and rows[-1][k] != rows[0][k]
+            for k in ("request_id", "occurrence_id")
+        ),
         "unexpected_callback_count",
     )
     require(
@@ -581,6 +698,10 @@ def run_case(
         server_port=port,
         policy_generation=config["generation"],
         grant_generation=grant["grant_generation"],
+        grant_id=grant["grant_id"],
+        invocation_revision=active["revision"],
+        request_id=row["request_id"],
+        occurrence_id=row["occurrence_id"],
         threshold=config["threshold"],
         classifier_profile=config["profile"],
         bootstrap_stdout=bootstrap,
@@ -601,9 +722,16 @@ def run_case(
         result["agent"] = {"binary": str(binary), "sha256": SHA, "version": VERSION}
     if case in ("transport-outage", "late-reply"):
         require(
-            row["outcome"] != "response_prepared" and stage == "allow_no_output",
+            row["outcome"]
+            in (
+                {"offline"}
+                if case == "transport-outage"
+                else {"timeout", "reserved_unknown"}
+            )
+            and stage == "allow_no_output",
             "fallback_not_observed",
         )
+        result["controlled_fault"] = fault["fault"]
         result["local_outcome"] = row["outcome"]
         if case == "late-reply":
             items = api("GET", path)["items"]
@@ -720,7 +848,34 @@ def run_case(
         )
         require(ack == {"acknowledged": 1}, "missing_delivery_ack")
     result["decision"] = matched()
+    verify_delivery(result["decision"]["delivery_reports"], reports)
     return result
+
+
+def collector_entry(cli):
+    # Bind the actual console script to the selected venv PATH spelling.
+    # Resolving its python symlink here would erase the venv identity.
+    python = cli.parent / "python"
+    require(
+        cli.is_absolute() and cli == cli.resolve() and cli.name == "tidewall-collector",
+        "invalid_collector_launcher",
+    )
+    expected_body = """import sys
+from tidewall_collector.cli import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
+"""
+    require(
+        cli.read_bytes() == (f"#!{python}\n" + expected_body).encode(),
+        "collector_launcher_binding_mismatch",
+    )
+    return [
+        str(python),
+        "-I",
+        "-c",
+        "from tidewall_collector.cli import main; raise SystemExit(main())",
+    ]
 
 
 def collector_provenance(cli, wheel):
@@ -736,14 +891,15 @@ def collector_provenance(cli, wheel):
         cli.is_absolute() and cli.name == "tidewall-collector" and cli.is_file(),
         "installed_collector_required",
     )
+    collector_entry(cli)
     with tempfile.TemporaryDirectory() as directory:
         audit = subprocess.run(
             [
                 cli.parent / "python",
                 "-I",
                 "-c",
-                "from importlib.metadata import distributions; import json,tidewall_collector.native_hook as h;"
-                "print(json.dumps([[d.metadata['Name'] for d in distributions()],h.__file__]))",
+                "from importlib.metadata import distributions; import json,sys,tidewall_collector.native_hook as h;"
+                "print(json.dumps([[d.metadata['Name'] for d in distributions()],h.__file__, sys.prefix, sys.executable]))",
             ],
             cwd=directory,
             env={"HOME": directory, "PATH": os.defpath},
@@ -751,7 +907,11 @@ def collector_provenance(cli, wheel):
             check=True,
             timeout=10,
         )
-    distributions, origin = json.loads(audit.stdout)
+    distributions, origin, prefix, executable = json.loads(audit.stdout)
+    require(
+        Path(prefix) == cli.parent.parent and Path(executable) == cli.parent / "python",
+        "collector_interpreter_mismatch",
+    )
     require(distributions == ["tidewall-collector"], "collector_environment_mismatch")
     site = Path(origin).resolve().parents[1]
     require(
@@ -765,6 +925,8 @@ def collector_provenance(cli, wheel):
                 "installed_module_mismatch",
             )
     return {
+        "interpreter": str(cli.parent / "python"),
+        "entrypoint": "tidewall_collector.cli:main",
         "wheel_sha256": wheel_digest,
         "launcher": str(cli),
         "launcher_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
