@@ -12,8 +12,33 @@ import time
 
 
 def serve():
-    import os
     import sys
+
+    # Refuse accidental standalone execution before imports, migrations or seeding.
+    root = Path(os.environ.get("HOME", ""))
+    db_path = root / "fixture.db"
+    if (
+        len(sys.argv) != 3
+        or os.environ.get("TMPDIR") != str(root)
+        or os.environ.get("DB_URL") != "sqlite:///" + str(db_path)
+        or root != root.resolve()
+        or not root.is_dir()
+        or root.stat().st_uid != os.getuid()
+        or root.stat().st_mode & 0o077
+    ):
+        raise SystemExit("isolated_receiver_required")
+    try:
+        with socket.socket(fileno=os.dup(int(sys.argv[1]))) as selected:
+            if (
+                selected.family != socket.AF_INET
+                or selected.getsockname()[0] != "127.0.0.1"
+            ):
+                raise ValueError
+        with db_path.open("xb"):
+            pass
+    except (ValueError, OSError):
+        raise SystemExit("isolated_receiver_required") from None
+
     from alembic import command
     from alembic.config import Config
     from app.auth.key_utils import hash_key
@@ -59,7 +84,6 @@ def serve():
         )
     from app.main import app
     import asyncio
-    from pathlib import Path
 
     async def boundary(scope, receive, send):
         async def deliver(message):

@@ -348,3 +348,24 @@ def test_ambiguous_trace_cannot_establish_observed_effect(tmp_path):
     events[-1]["prompt_submit_outcome"] = {"kind": "blocked_by_hook"}
     marker.touch()
     assert not demo.trace(framed(demo, events, sid, marker), sid, marker)["positive"]
+
+
+def test_receiver_refuses_existing_or_unselected_state_before_any_server_import(
+    tmp_path,
+):
+    import subprocess
+    import sys
+
+    helper = ROOT / "scripts/native_prompt_receiver.py"
+    existing = tmp_path / "fixture.db"
+    existing.write_bytes(b"owned-test-sentinel")
+    for argv in ([], ["9999", "benign"]):
+        run = subprocess.run(
+            [sys.executable, "-I", helper, *argv],
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            env={"HOME": str(tmp_path), "DB_URL": "sqlite:///" + str(existing)},
+            capture_output=True,
+        )
+        assert run.returncode and run.stderr == b"isolated_receiver_required\n"
+        assert existing.read_bytes() == b"owned-test-sentinel"
