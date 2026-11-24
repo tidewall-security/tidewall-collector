@@ -59,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         "recover",
         "fixture",
         "ship",
+        "refresh",
         "status",
         "offboard",
         "prepare-native-session",
@@ -87,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument(
                 "--new-session",
                 action="store_true",
-                help="Select a fresh metadata-only session and discard prior local reports.",
+                help="Select a fresh metadata-only session. Reuse the same session after its grant expires. Discard prior local reports.",
             )
         if cmd == "report-native":
             mode = p.add_mutually_exclusive_group()
@@ -220,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             )
+        elif args.command == "refresh":
+            back.refresh(back.owner())
         elif args.command == "offboard":
             back.offboard(args.device_id)
             print("offboarded")

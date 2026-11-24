@@ -313,6 +313,8 @@ def test_native_negative_trace_requires_complete_correlated_receipts(tmp_path, c
         "reversed",
         "nonempty",
         "missing-completion",
+        "effect-before-hook",
+        "contradictory-stdout",
     ],
 )
 def test_native_positive_requires_exact_action_and_successful_tool_result(
@@ -339,6 +341,13 @@ def test_native_positive_requires_exact_action_and_successful_tool_result(
     if change == "missing-completion":
         result.pop("content")
     raw = framed(demo, events, sid, marker)
+    if change == "effect-before-hook":
+        raw = b"\n".join(
+            demo.compact(e) for e in [events[i] for i in (0, 3, 4, 1, 2, 5)]
+        )
+    if change == "contradictory-stdout":
+        events[2]["stdout"] = demo.BLOCK.decode()
+        raw = b"\n".join(demo.compact(e) for e in events)
     if change == "nonempty":
         with pytest.raises(demo.QualificationError):
             demo.trace(raw, sid, marker)
@@ -692,3 +701,28 @@ def test_review_submitted_delivery_ack_cannot_substitute_for_readback(
     assert len(omitted) == 1 and fleet.sql(
         "select count(*) from native_prompt_deliveries"
     ) == [(3,)]
+
+
+def test_agent_witness_must_match_hook_response(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    demo = load_demo()
+    work = tmp_path.resolve()
+    sid = str(uuid4())
+    receipt = work / "output-witness"
+    marker = work / demo.MARKER
+    monkeypatch.setattr(demo, "owned", lambda _: None)
+    monkeypatch.setattr(demo, "verify_binary", lambda *_: None)
+
+    def fake_process(*_args, **_kwargs):
+        marker.touch()
+        receipt.write_text("stdout_flushed")
+        return SimpleNamespace(
+            returncode=0, stdout=framed(demo, fixture_trace(demo, sid), sid, marker)
+        )
+
+    monkeypatch.setattr(demo.subprocess, "run", fake_process)
+    with pytest.raises(demo.QualificationError, match="hook_stdout_witness_mismatch"):
+        demo.agent_run(
+            work / "synthetic", work, work, sid, "test", [], receipt, "metadata"
+        )

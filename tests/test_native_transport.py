@@ -24,11 +24,11 @@ def test_paired_contract_and_all_client_vectors():
     for name, expected in [
         (
             "native_prompt_v1.json",
-            "dac0f1b196fe3e873aaa3ac224216a92e292b93025deb0a369cc34ecedd77374",
+            "9c671d0c3d1ad1c470f465df288790b22ddb84753fe6ebc126756b99f86aad35",
         ),
         (
             "native_prompt_v1_vectors.json",
-            "614ae134bf19ddf65a5fc655a651830d0f3a158ffd27ccf4a28293d6d4ce0214",
+            "668627721b6588152b01564f38e074c6565a6f4e6e8e7792324ac974bed4a8e5",
         ),
     ]:
         assert hashlib.sha256((FILES / name).read_bytes()).hexdigest() == expected
@@ -558,7 +558,8 @@ def test_public_decision_requires_both_permissions_for_content_states(
     assert sent == ["capture_disabled"]
 
 
-def test_installed_same_session_administrative_policy_regrant(fleet):
+@pytest.mark.parametrize("full_expiry", [False, True])
+def test_installed_same_session_administrative_policy_regrant(fleet, full_expiry):
     """Reconfigure a live migrated Server, then install its newer scoped grant."""
     import sqlite3
     from contextlib import closing
@@ -572,7 +573,7 @@ def test_installed_same_session_administrative_policy_regrant(fleet):
     root = f.root / "A"
     backend = TidewallBackend(root, fixture_loopback=True)
     owner = backend.owner()
-    backend.refresh(owner)
+    f.call("refresh", "A")
     native = NativeState(backend, root / "native-session.json")
     # The Phase 1 fixture's intentionally bare policy needs an input rule.
     with closing(sqlite3.connect(f.root / "fixture.db")) as db, db:
@@ -594,7 +595,7 @@ def test_installed_same_session_administrative_policy_regrant(fleet):
         assert status == 200
         return config["generation"]
 
-    def prepare(g=None, *, capture=False, success=True):
+    def prepare(g=None, *, capture=False, new_session=False, success=True):
         secrets = [("--session-id-fd", "synthetic-regrant")]
         if g:
             secrets.append(("--grant-fd", json.dumps(g)))
@@ -608,13 +609,14 @@ def test_installed_same_session_administrative_policy_regrant(fleet):
             "--agent-version",
             wire.VERSION,
             *(["--capture"] if capture else []),
+            *(["--new-session"] if new_session else []),
             secrets=secrets,
             success=success,
         )
 
     token = json.loads(prepare().stdout)["session_token"]
 
-    def issue(**extra):
+    def issue(*, ttl_seconds=300, **extra):
         status, g = f.request(
             "POST",
             "/v1/native-prompt/grants",
@@ -623,7 +625,7 @@ def test_installed_same_session_administrative_policy_regrant(fleet):
                 device_id=device["device_id"],
                 session_token=token,
                 native_profile=wire.PROFILE,
-                ttl_seconds=300,
+                ttl_seconds=ttl_seconds,
                 **extra,
             ),
         )
@@ -648,8 +650,83 @@ def test_installed_same_session_administrative_policy_regrant(fleet):
         return backend.observe_native(auth, observation, time.monotonic() + 1.8)
 
     selected = observe()["session_id"]
-    first = issue(capture_allowed=True, session_id=selected)
+    first = issue(
+        capture_allowed=True, session_id=selected, ttl_seconds=3 if full_expiry else 300
+    )
     prepare(first, capture=True)
+    if full_expiry:
+        import subprocess
+        from datetime import datetime
+        from test_foundation_roundtrip import SERVER
+
+        def hook():
+            event = dict(
+                hook_event_name="UserPromptSubmit",
+                session_id="synthetic-regrant",
+                cwd=str(f.root),
+                prompt="synthetic",
+            )
+            r = _installed_call(
+                f.cli, root, f.root, "claude-hook", data=wire.encode(event)
+            )
+            assert r.returncode == 0 and not r.stderr
+
+        hook()
+        with native.open(owner) as session:
+            prior_request = session.records["rows"][-1]["request_id"]
+        assert prepare(new_session=True, success=False).returncode != 0
+        # Let the real short-lived capture grant expire locally. Use the Server's
+        # retention clock to advance the independent 30-day purge horizon.
+        expires = datetime.fromisoformat(first["expires_at"]).timestamp()
+        time.sleep(max(0.0, expires - time.time()))
+        subprocess.run(
+            [
+                Path(SERVER) / ".venv/bin/python",
+                "-c",
+                "from datetime import UTC, datetime, timedelta; import sys; "
+                "from app.db.engine import get_engine, get_session_factory; "
+                "from app.services.collection_retention import purge_collection; "
+                "s=get_session_factory(get_engine('sqlite:///'+sys.argv[1]))(); "
+                "purge_collection(s, datetime.now(UTC)+timedelta(days=31)); s.close()",
+                str(f.root / "fixture.db"),
+            ],
+            cwd=SERVER,
+            check=True,
+            timeout=15,
+        )
+        assert f.sql("SELECT session_id FROM agent_sessions") == []
+        assert f.sql("SELECT grant_id FROM native_prompt_grants") == []
+        fresh = issue()
+        assert (
+            fresh["grant_generation"] == 1
+            and prepare(fresh, success=False).returncode != 0
+        )
+        assert json.loads(prepare(new_session=True).stdout)["session_token"] == token
+        with native.open(owner) as session:
+            assert session.config["grant"] is None and not session.config["capture"]
+            assert (
+                "selected_session" not in session.records
+                and not session.records["rows"]
+            )
+            assert session.records["lost"] >= 1 and session.records["discarded"] >= 1
+        assert prior_request.encode() not in native.journal.read_bytes()
+        prepare(fresh)
+        hook()
+        with native.open(owner) as session:
+            new_session = session.records["selected_session"]
+            assert new_session != selected
+        assert f.sql("SELECT input_state FROM native_prompt_decisions") == [
+            ("capture_disabled",)
+        ]
+        capture_grant = issue(capture_allowed=True, session_id=new_session)
+        prepare(capture_grant, capture=True)
+        hook()
+        assert sorted(f.sql("SELECT input_state FROM native_prompt_decisions")) == [
+            ("capture_disabled",),
+            ("complete",),
+        ]
+        return
+
     second_generation = configure(0.75)
     assert second_generation > initial_generation
     with pytest.raises(BackendError, match="grant_revoked"):
@@ -672,3 +749,44 @@ def test_installed_same_session_administrative_policy_regrant(fleet):
             session.authority().capture
             and session.authority().grant["grant_id"] == new["grant_id"]
         )
+
+
+def test_native_transport_deadline_stops_at_access_expiry(native, monkeypatch):
+    from test_native_state import grant
+    from uuid import uuid4
+
+    back, state, owner, token, work = native
+    g = grant(owner, token, capture=False)
+    state.prepare("synthetic-session", work, "2.1.330", False, g)
+    expires = int(time.time()) + 5
+    with back._locked() as locked:
+        data = locked.read()
+        data["access_expires_at"] = expires
+        locked.write(data)
+    with state.open(owner) as session:
+        auth = session.authority()
+    observation = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        session_token=token,
+        agent="claude-code",
+        native_profile=wire.PROFILE,
+        agent_version=wire.VERSION,
+    )
+    seen = []
+
+    def post(*args, deadline, **kwargs):
+        seen.append(deadline)
+        return 200, wire.encode(
+            dict(
+                version=1,
+                occurrence_id=observation["occurrence_id"],
+                event_id=str(uuid4()),
+                session_id=str(uuid4()),
+            )
+        )
+
+    monkeypatch.setattr(back, "_post", post)
+    limit = time.monotonic() + expires - time.time()
+    back.observe_native(auth, observation, time.monotonic() + 20)
+    assert len(seen) == 1 and abs(seen[0] - limit) < 0.01

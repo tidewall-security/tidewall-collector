@@ -38,6 +38,7 @@ class Authority:
     generation: str
     revision: str
     access: str = field(repr=False)
+    access_expires_at: int
     grant: dict = field(repr=False)
     capture: bool
     session_token: str
@@ -194,6 +195,7 @@ class NativeState:
                 actual,
                 current,
                 data["access"],
+                data.get("access_expires_at"),
                 key,
                 bound,
                 config,
@@ -254,6 +256,7 @@ class NativeState:
             selection = str(uuid4())
             previous_selection = None
             bootstrap_required = new_session
+            policy_floor = None
             if "native_revision" not in data:
                 # Before the first committed config no invocation can reserve.
                 # Resume only a private, authenticated empty birth journal.
@@ -296,7 +299,16 @@ class NativeState:
                             and not previous["capture"]
                         ):
                             return token
-                        raise BackendError("session_mismatch")
+                        old = previous["grant"]
+                        if (
+                            not old
+                            or previous["cwd_token"] != directory
+                            or datetime.fromisoformat(old["expires_at"])
+                            > datetime.now(UTC)
+                        ):
+                            raise BackendError("session_mismatch")
+                        # Only the purged session's grant sequence can restart.
+                        policy_floor = [old["policy_id"], old["policy_generation"]]
                     previous_selection = previous["selection"]
                 else:
                     if (
@@ -306,6 +318,16 @@ class NativeState:
                         raise BackendError("session_mismatch")
                     selection = previous["selection"]
                     bootstrap_required = previous["bootstrap_required"]
+                    policy_floor = previous.get("policy_floor")
+                    if (
+                        grant
+                        and policy_floor
+                        and (
+                            grant["policy_id"] != policy_floor[0]
+                            or grant["policy_generation"] < policy_floor[1]
+                        )
+                    ):
+                        raise BackendError("grant_mismatch")
                     old = previous["grant"]
                     if old and grant is None:
                         if capture:
@@ -342,6 +364,7 @@ class NativeState:
                 version=1,
                 selection=selection,
                 previous_selection=previous_selection,
+                policy_floor=policy_floor,
                 bootstrap_required=bootstrap_required,
                 revision=str(uuid4()),
                 session_token=token,
@@ -366,24 +389,34 @@ class NativeState:
         if "native_state" not in data:
             return
         paths = [locked.path / n for n in (CONFIG, JOURNAL)]
-        if any(os.path.lexists(p) for p in paths):
-            generation = data["queue_generation"]
-            key = _enrollment_key(locked.path, owner, generation)
-            bound = [
-                owner.origin,
-                str(owner.device_id),
-                generation,
-                data["native_state"],
-            ]
-            for p, limit in zip(paths, (8192, MAX_JOURNAL), strict=True):
-                if os.path.lexists(p):
-                    _load(key, bound, p, limit)
-        for p in paths:
-            for member in (p.with_suffix(".next"), p):
+        if not any(
+            os.path.lexists(member)
+            for p in paths
+            for member in (p, p.with_suffix(".next"))
+        ):
+            return
+        generation = data["queue_generation"]
+        key = _enrollment_key(locked.path, owner, generation)
+        bound = [owner.origin, str(owner.device_id), generation, data["native_state"]]
+        unresolved = []
+        for p, limit in zip(paths, (8192, MAX_JOURNAL), strict=True):
+            for staged in (False, True):
+                member = p.with_suffix(".next") if staged else p
                 if os.path.lexists(member):
-                    _private_file(member)
+                    try:
+                        _load(key, bound, p, limit, staged=staged)
+                    except BackendError:
+                        unresolved.append(member)
+                        continue
                     member.unlink()
         os.fsync(locked.root)
+        if unresolved:
+            which = (
+                "config"
+                if any(p.stem == paths[0].stem for p in unresolved)
+                else "journal"
+            )
+            raise BackendError("offboard_unverified_native_" + which)
 
 
 def _unreported(rows):
@@ -399,10 +432,21 @@ class _Session:
     """A short operation under the enrollment lock. No network calls belong here."""
 
     def __init__(
-        self, state, locked, owner, generation, access, key, binding, config, records
+        self,
+        state,
+        locked,
+        owner,
+        generation,
+        access,
+        access_expires_at,
+        key,
+        binding,
+        config,
+        records,
     ):
         self.locked = locked
         self.state, self.owner, self.generation = state, owner, generation
+        self.access_expires_at = access_expires_at
         self.access, self.key, self.binding = access, key, binding
         self.config, self.records = config, records
 
@@ -429,11 +473,17 @@ class _Session:
             raise BackendError("grant_missing")
         if datetime.fromisoformat(grant["expires_at"]) <= datetime.now(UTC):
             raise BackendError("grant_expired")
+        if (
+            type(self.access_expires_at) is not int
+            or self.access_expires_at <= time.time()
+        ):
+            raise BackendError("access_refresh_required")
         return Authority(
             self.owner,
             self.generation,
             self.config["revision"],
             self.access,
+            self.access_expires_at,
             grant,
             self.config["capture"],
             self.config["session_token"],
@@ -447,6 +497,7 @@ class _Session:
         if (
             data["status"] != "active"
             or data["access"] != self.access
+            or data.get("access_expires_at") != self.access_expires_at
             or data.get("queue_generation") != self.generation
             or data.get("native_state") != self.binding[-1]
             or data.get("native_revision") != self.config["revision"]
@@ -590,7 +641,7 @@ class _Session:
 
 LOCAL_CODES = wire.REFUSALS | frozenset(
     (
-        "grant_missing native_inactive profile_mismatch session_mismatch cwd_mismatch "
+        "grant_missing access_refresh_required native_inactive profile_mismatch session_mismatch cwd_mismatch "
         "unsupported_event invalid_input input_limit timeout busy offline invalid_reply stale_authority "
         "native_capacity storage_unavailable native_unprepared native_state_invalid owner_mismatch"
     ).split()

@@ -408,3 +408,41 @@ def test_local_binding_errors_retain_their_code_without_transport(
     assert invoke(back, state, payload(tmp_path, "synthetic")) == b""
     expected = "native_state_invalid" if fault == "after_reservation" else fault
     assert capfd.readouterr().err.strip() == expected
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_access_expiry_prevents_content_until_explicit_refresh(
+    native, monkeypatch, legacy
+):
+    back, state, owner, token, work = native
+    monkeypatch.chdir(work)
+    g = grant(owner, token)
+    state.prepare("synthetic-session", work, "2.1.330", True, g)
+    with back._locked() as locked:
+        data = locked.read()
+        if legacy:
+            data.pop("access_expires_at", None)
+        else:
+            data["access_expires_at"] = int(time.time()) - 1
+        locked.write(data)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            native_hook.wire,
+            "input_state",
+            lambda _: pytest.fail("content constructed"),
+        )
+        patch.setattr(
+            back, "_post", lambda *_a, **_k: pytest.fail("unexpected network transfer")
+        )
+        assert invoke(back, state, payload(work, "synthetic")) == b""
+    with state.open(owner) as session:
+        assert session.records["rows"][-1]["outcome"] == "access_refresh_required"
+    back.refresh(owner)
+    seen = []
+
+    def decide(auth, request, deadline):
+        seen.append(request["prompt"])
+        return reply(request, g)
+
+    monkeypatch.setattr(back, "decide_native", decide)
+    assert invoke(back, state, payload(work, "synthetic")) and seen == ["synthetic"]

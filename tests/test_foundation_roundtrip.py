@@ -44,6 +44,8 @@ def serve_fixture():
     from app.db.models import Policy, APIKey
     from app.interaction_log import InteractionLog
     from app.main import create_app
+    from app.services.native_prompt_decisions import NativeDecisionService
+    from uuid import uuid4
     import uvicorn
 
     work = Path(sys.argv[1])
@@ -73,6 +75,9 @@ def serve_fixture():
     app = create_app()
     app.state.session_factory = sessions
     app.state.interaction_log = InteractionLog(sessions)
+    app.state.native_decisions = NativeDecisionService(
+        sessions, None, process_id=uuid4()
+    )
 
     async def boundary(scope, receive, send):
         path = scope["path"]
@@ -440,7 +445,19 @@ def test_foundation_roundtrip(fleet):
     )
     assert len(events) == 11
     assert json.loads(f.call("status", "A").stdout)["heartbeat"]["pending"] == 11
+    # Upgrade compatibility: an existing Phase 1 credential may lack the access lifetime.
+    # Both metadata writes still use the active access token, including replay of this batch.
+    active = TidewallBackend(f.root / "A", fixture_loopback=True)
+    with active._locked() as locked:
+        data = locked.read()
+        del data["access_expires_at"]
+        locked.write(data)
+    before = len(f.routes())
     f.call("ship", "A")
+    assert [r[2] for r in f.routes()[before:]] == [
+        "/v1/collector/observations",
+        "/v1/collector/heartbeat",
+    ]
     assert (
         f.sql("select event_id,source_key from agent_observations order by event_id")
         == events

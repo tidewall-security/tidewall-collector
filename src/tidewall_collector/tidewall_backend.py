@@ -364,7 +364,7 @@ def _failure(status: int) -> BackendError:
     return BackendError("request_refused")
 
 
-def _device_reply(body: bytes, enrol: bool) -> tuple[UUID, str, str, str]:
+def _device_reply(body: bytes, enrol: bool) -> tuple[UUID, str, str, str, int]:
     try:
         message = admission.wire_json(body, 8192)
         r = message["result"]
@@ -385,7 +385,10 @@ def _device_reply(body: bytes, enrol: bool) -> tuple[UUID, str, str, str]:
             or not re.fullmatch("[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}", code)
         ):
             raise ValueError
-        return device, access, refresh, code
+        lifetime = r["access_token"]["expires_in"]
+        if type(lifetime) is not int or not 0 < lifetime <= 2**31 - 1:
+            raise ValueError
+        return device, access, refresh, code, lifetime
     except (AttributeError, ValueError, TypeError, KeyError):
         raise BackendError("invalid_device_reply") from None
 
@@ -584,17 +587,19 @@ class TidewallBackend:
             )
             if recovery is not None:
                 request["recovery_secret"] = recovery
+            issued_after = int(time.time())
             status, body = self._post(
                 origin, REGISTRATION, registration, admission.canonical(request), 8192
             )
             if status != 201:
                 raise _failure(status)
-            device, access, refresh, code = _device_reply(body, True)
+            device, access, refresh, code, lifetime = _device_reply(body, True)
             owner = Owner(origin, device)
             data = dict(
                 device_id=str(device),
                 origin=origin,
                 access=access,
+                access_expires_at=issued_after + lifetime,
                 refresh=refresh,
                 installation_id=str(installation),
                 status="device_pending",
@@ -686,6 +691,7 @@ class TidewallBackend:
             raise BackendError(data["status"])
         self._check_generation(data, queue)
         queue.cancel_flight(owner)
+        issued_after = int(time.time())
         status, body = self._post(
             owner.origin,
             f"/v1/devices/{owner.device_id}/refresh",
@@ -695,11 +701,15 @@ class TidewallBackend:
         )
         self._check_reply(state, owner, data, queue)
         if status == 200:
-            device, access, _, _ = _device_reply(body, False)
+            device, access, _, _, lifetime = _device_reply(body, False)
             if device != owner.device_id:
                 raise BackendError("owner_mismatch")
             data.pop("setup", None)
-            data.update(access=access, status="active")
+            data.update(
+                access=access,
+                access_expires_at=issued_after + lifetime,
+                status="active",
+            )
             state.write(data)
             return
         if status in (401, 403, 202):
@@ -906,16 +916,20 @@ class TidewallBackend:
         return native
 
     def _native_post(self, auth, path, body, request_type, reply_type, deadline):
-        from datetime import UTC, datetime
+        from datetime import datetime
         from . import native_contract as wire
 
         self._native_binding(auth)
-        lifetime = (
-            datetime.fromisoformat(auth.grant["expires_at"]) - datetime.now(UTC)
-        ).total_seconds()
-        if lifetime <= 0:
+        started = time.monotonic()
+        wall_now = time.time()
+        grant_end = datetime.fromisoformat(auth.grant["expires_at"]).timestamp()
+        if grant_end <= wall_now:
             raise BackendError("grant_expired")
-        deadline = min(deadline, time.monotonic() + lifetime)
+        if auth.access_expires_at <= wall_now:
+            raise BackendError("access_refresh_required")
+        deadline = min(
+            deadline, started + (min(grant_end, auth.access_expires_at) - wall_now)
+        )
         encoded = wire.encode(body)
         wire.parse(request_type, encoded)
         status, raw = self._post(

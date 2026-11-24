@@ -255,7 +255,14 @@ def agent_run(binary, context, work, sid, prompt, args, receipt, selection):
         timeout=90,
     )
     require(r.returncode == 0 and receipt.is_file(), "agent_or_hook_unavailable")
-    return receipt.read_text(), trace(r.stdout, sid, marker)
+    stage = receipt.read_text()
+    evidence = trace(r.stdout, sid, marker)
+    require(
+        stage in ("allow_no_output", "stdout_flushed")
+        and stage == evidence["hook_output"],
+        "hook_stdout_witness_mismatch",
+    )
+    return stage, evidence
 
 
 def valid_tool_result(result):
@@ -324,7 +331,7 @@ def trace(raw, sid, marker):
         "unverified_hook_environment",
     )
     blocks = []
-    for event in events:
+    for position, event in enumerate(events):
         kind = event.get("type")
         if kind not in ("assistant", "user"):
             continue
@@ -344,9 +351,17 @@ def trace(raw, sid, marker):
                 require(kind == "assistant", "unexpected_tool_source")
             if block["type"] == "tool_result":
                 require(kind == "user", "unexpected_result_source")
-            blocks.append(block)
-    tools = [b for b in blocks if b.get("type") == "tool_use"]
-    results = [b for b in blocks if b.get("type") == "tool_result"]
+            blocks.append((position, block))
+    tools = [(pos, b) for pos, b in blocks if b["type"] == "tool_use"]
+    results = [(pos, b) for pos, b in blocks if b["type"] == "tool_result"]
+    hook_stdout = ends[0].get("stdout")
+    hook_output = (
+        "allow_no_output"
+        if hook_stdout == ""
+        else "stdout_flushed"
+        if hook_stdout in (BLOCK.decode(), BLOCK.decode().rstrip("\n"))
+        else "unknown"
+    )
     acks = [e for e in events if "prompt_submit_outcome" in e]
     # One native process receives one prompt. Bind the explicit informational
     # acknowledgement to that session, after its unique UserPromptSubmit response.
@@ -357,7 +372,7 @@ def trace(raw, sid, marker):
         and ack.get("subtype") == "informational"
         and ack.get("session_id") == sid
         and ack.get("prevent_continuation") is True
-        and ends[0].get("stdout") in (BLOCK.decode(), BLOCK.decode().rstrip("\n"))
+        and hook_output == "stdout_flushed"
         and isinstance(outcome, dict)
         and outcome.get("kind") == "blocked_by_hook"
         and outcome.get("prompt_kept") is False
@@ -381,15 +396,16 @@ def trace(raw, sid, marker):
             and e["prompt_submit_outcome"].get("kind") != "blocked_by_hook"
             for e in acks
         )
+        and hook_output == "allow_no_output"
         and len(tools) == len(results) == 1
-        and tools[0].get("name") == "Bash"
-        and tools[0].get("input", {}).get("command") == COMMAND
-        and set(tools[0].get("input", {})) <= {"command", "description", "timeout"}
-        and isinstance(tools[0].get("id"), str)
-        and bool(tools[0]["id"].strip())
-        and blocks.index(tools[0]) < blocks.index(results[0])
-        and valid_tool_result(results[0])
-        and results[0].get("tool_use_id") == tools[0]["id"]
+        and tools[0][1].get("name") == "Bash"
+        and tools[0][1].get("input", {}).get("command") == COMMAND
+        and set(tools[0][1].get("input", {})) <= {"command", "description", "timeout"}
+        and isinstance(tools[0][1].get("id"), str)
+        and bool(tools[0][1]["id"].strip())
+        and events.index(ends[0]) < tools[0][0] < results[0][0] < len(events) - 1
+        and valid_tool_result(results[0][1])
+        and results[0][1].get("tool_use_id") == tools[0][1]["id"]
         and final.get("subtype") == "success"
         and final.get("is_error") is False
         and present
@@ -398,6 +414,7 @@ def trace(raw, sid, marker):
         ack_blocked and not tools and not results and not present and counts == [0] * 4
     )
     return dict(
+        hook_output=hook_output,
         positive=positive,
         blocked=blocked,
         tool_count=len(tools),

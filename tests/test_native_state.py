@@ -322,3 +322,70 @@ def test_reserved_row_records_local_binding_errors_when_storage_recovers(native,
     with state.open(owner) as session:
         assert session.row(request_id)["outcome"] == code
         assert session.row(request_id)["reports"] == []
+
+
+@pytest.mark.parametrize("artifact", ["corrupt", "foreign", "symlink"])
+def test_interrupted_offboard_retires_verified_secret_and_resumes(
+    native, tmp_path, artifact
+):
+    back, state, owner, token, work = native
+    state.prepare("synthetic-session", work, "2.1.330", True, grant(owner, token))
+    foreign = tmp_path / "foreign"
+    foreign.write_bytes(b"foreign")
+    if artifact == "symlink":
+        state.journal.unlink()
+        state.journal.symlink_to(foreign)
+    elif artifact == "foreign":
+        state.journal.write_bytes(state.path.read_bytes())
+    else:
+        state.journal.write_bytes(b"{}")
+    for _ in range(2):
+        with pytest.raises(BackendError, match="offboard_unverified_native_journal"):
+            back.offboard(owner.device_id)
+        assert not state.path.exists() and os.path.lexists(state.journal)
+        assert foreign.read_bytes() == b"foreign"
+    # Operator identifies and moves the unverified artifact outside enrollment.
+    state.journal.rename(tmp_path / "isolated-artifact")
+    back.offboard(owner.device_id)
+    assert (
+        not (back.root / "credentials.json").exists()
+        and not (back.root / "queue").exists()
+    )
+
+
+def test_same_token_expired_selection_restarts_only_at_metadata(native, monkeypatch):
+    from tidewall_collector import native_state as store
+
+    _, state, owner, token, work = native
+    old = grant(owner, token)
+    state.prepare("synthetic-session", work, "2.1.330", True, old)
+    now = datetime.now(UTC) + timedelta(minutes=11)
+
+    class Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(store, "datetime", Later)
+    fresh = dict(
+        grant(owner, token, capture=False),
+        grant_generation=1,
+        expires_at=(now + timedelta(minutes=5)).isoformat(),
+    )
+    with pytest.raises(BackendError, match="grant_mismatch"):
+        state.prepare("synthetic-session", work, "2.1.330", False, fresh)
+    assert (
+        state.prepare(
+            "synthetic-session", work, "2.1.330", False, None, new_session=True
+        )
+        == token
+    )
+    for enabled in (old, dict(old, expires_at=fresh["expires_at"], grant_generation=3)):
+        with pytest.raises(BackendError):
+            state.prepare("synthetic-session", work, "2.1.330", True, enabled)
+    state.prepare("synthetic-session", work, "2.1.330", False, fresh)
+    with state.open(owner) as session:
+        assert (
+            session.authority().selected_session is None
+            and not session.authority().capture
+        )
