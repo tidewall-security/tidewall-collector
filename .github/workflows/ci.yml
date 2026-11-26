@@ -1,0 +1,211 @@
+name: Collector CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  collector:
+    name: Collector tests and Server compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHON_VERSION: "3.13.14"
+      QUALIFIED_WHEEL_SHA256: d599ba7d5154d0f0b1e2664cd0b78deb025c7adf0083b898e9acdcdd21527cb8
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out Collector
+        uses: actions/checkout@v4
+        with:
+          path: collector
+          persist-credentials: false
+
+      - name: Check out current Server
+        uses: actions/checkout@v4
+        with:
+          repository: tidewall-security/tidewall-server
+          ref: a7fa9b81172c75427210bc23d2306129a08b66fe
+          path: server-current
+          persist-credentials: false
+
+      - name: Check out Phase 1 Server
+        uses: actions/checkout@v4
+        with:
+          repository: tidewall-security/tidewall-server
+          ref: e1a8fd55e3109664ac781189f78007a56ea0f39e
+          path: server-legacy
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.21"
+          enable-cache: false
+          prune-cache: false
+
+      - name: Install locked Server dependencies
+        working-directory: server-current
+        env:
+          UV_PYTHON_DOWNLOADS: never
+        run: |
+          uv --version
+          uv sync --locked --group dev --python "$PYTHON_VERSION"
+
+      - name: Prepare Collector build and test tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/collector-ci"
+          python --version
+          python -m venv "$RUNNER_TEMP/collector-venv"
+          collector_python="$RUNNER_TEMP/collector-venv/bin/python"
+          "$collector_python" -m pip install --only-binary=:all: \
+            pip==26.1.2 pytest==9.2.0 setuptools==84.2.1 wheel==0.48.0 packaging==26.3 \
+            iniconfig==2.3.1 pluggy==1.7.0 Pygments==2.21.0
+          "$collector_python" -m pip list --format=freeze
+
+      - name: Verify both Server imports and record source revisions
+        run: |
+          git -C collector rev-parse HEAD
+          ln -s "$PWD/server-current/.venv" server-legacy/.venv
+          for source in server-current server-legacy; do
+            (
+              cd "$source"
+              git rev-parse HEAD
+              .venv/bin/python -BEs - "$source" <<'PY'
+          import sys
+          from importlib.util import find_spec
+          from pathlib import Path
+
+          from app.routes import collector_ingest
+
+          source = sys.argv[1]
+          root = Path.cwd()
+          origin = Path(collector_ingest.__file__).resolve()
+          if origin != root / "app/routes/collector_ingest.py":
+              raise SystemExit(f"{source}: unexpected collector_ingest origin {origin}")
+
+          decisions = find_spec("app.services.native_prompt_decisions")
+          if source == "server-current":
+              expected = root / "app/services/native_prompt_decisions.py"
+              if decisions is None or Path(decisions.origin).resolve() != expected:
+                  raise SystemExit(f"{source}: native decisions must resolve to {expected}")
+          elif decisions is not None:
+              raise SystemExit(f"{source}: unexpectedly found native decisions")
+          print(f"{source}: collector_ingest={origin}, native_decisions={decisions is not None}")
+          PY
+            )
+          done
+
+      - name: Run full Collector suite with current Server and simulated fixtures
+        id: current
+        continue-on-error: true
+        working-directory: collector
+        env:
+          TIDEWALL_SERVER_ROOT: ${{ github.workspace }}/server-current
+          PIP_NO_INDEX: "1"
+        run: |
+          "$RUNNER_TEMP/collector-venv/bin/python" -m pytest -q -o junit_logging=no \
+            --basetemp "$RUNNER_TEMP/collector-ci/current" \
+            --junitxml "$RUNNER_TEMP/collector-ci/current.xml"
+
+      - name: Run installed backend and foundation checks with Phase 1 Server
+        id: legacy
+        continue-on-error: true
+        working-directory: collector
+        env:
+          TIDEWALL_SERVER_ROOT: ${{ github.workspace }}/server-legacy
+          PIP_NO_INDEX: "1"
+        run: |
+          "$RUNNER_TEMP/collector-venv/bin/python" -m pytest -q -o junit_logging=no \
+            --basetemp "$RUNNER_TEMP/collector-ci/legacy" \
+            --junitxml "$RUNNER_TEMP/collector-ci/legacy.xml" \
+            tests/test_backend.py tests/test_foundation_roundtrip.py
+
+      # The original outcomes keep a nonzero pytest exit fatal after both steps have run.
+      - name: Require both clean test reports and the qualified wheel
+        id: verify
+        if: ${{ !cancelled() }}
+        env:
+          CURRENT_OUTCOME: ${{ steps.current.outcome }}
+          LEGACY_OUTCOME: ${{ steps.legacy.outcome }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          from shutil import copyfile
+          from xml.etree import ElementTree as ET
+
+          work = Path(os.environ["RUNNER_TEMP"]) / "collector-ci"
+          junit = work / "junit"
+          junit.mkdir(parents=True, exist_ok=True)
+          qualified_digest = os.environ["QUALIFIED_WHEEL_SHA256"]
+          passed = True
+          for name in ("current", "legacy"):
+              outcome = os.environ.get(f"{name.upper()}_OUTCOME", "")
+              if outcome != "success":
+                  print(f"{name}: pytest outcome was {outcome or 'missing'}")
+                  passed = False
+
+              report = work / f"{name}.xml"
+              try:
+                  root = ET.parse(report).getroot()
+                  if root.tag != "testsuites" or len(root) != 1 or root[0].tag != "testsuite":
+                      raise ValueError("expected one pytest testsuite")
+                  suite = root[0]
+                  counts = {key: int(suite.attrib[key]) for key in ("tests", "skipped", "failures", "errors")}
+              except (OSError, ET.ParseError, KeyError, ValueError) as error:
+                  print(f"{name}: unusable JUnit report ({error})")
+                  passed = False
+                  continue
+
+              copyfile(report, junit / report.name)
+              print(f"{name}: {counts}")
+              if counts["tests"] <= 0 or counts["tests"] != len(suite.findall("testcase")):
+                  print(f"{name}: missing or inconsistent test cases")
+                  passed = False
+              for count, tag in (("skipped", "skipped"), ("failures", "failure"), ("errors", "error")):
+                  if counts[count] or suite.find(f".//{tag}") is not None:
+                      print(f"{name}: JUnit report contains {count}")
+                      passed = False
+
+              wheels = sorted((work / name).glob("installed[0-9]*/*.whl"))
+              if not wheels:
+                  print(f"{name}: pytest did not build an installed-test wheel")
+                  passed = False
+              for wheel in wheels:
+                  digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+                  print(f"{name}: {wheel.parent.name}/{wheel.name} SHA256 {digest}")
+                  if digest != qualified_digest:
+                      print(f"{name}: expected wheel SHA256 {qualified_digest}")
+                      passed = False
+
+          raise SystemExit(0 if passed else 1)
+          PY
+
+      - name: Upload Collector JUnit reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: collector-junit
+          path: ${{ runner.temp }}/collector-ci/junit/*.xml
+          if-no-files-found: ignore
+          retention-days: 7
