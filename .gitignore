@@ -23,6 +23,8 @@ otelcol-tidewall
 !/vendor/openaidr/src/openaidr/core/files.py
 !/vendor/openaidr/src/openaidr/core/hook_protocol.py
 !/vendor/openaidr/src/openaidr/core/toolmap.py
+!/vendor/openaidr/src/openaidr/guardrail/__init__.py
+!/vendor/openaidr/src/openaidr/guardrail/hooks.py
 !/vendor/openaidr/src/openaidr/sensor/__init__.py
 !/vendor/openaidr/src/openaidr/sensor/collectors.py
 !/vendor/openaidr/src/openaidr/sensor/spool.py

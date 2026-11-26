@@ -1,0 +1,792 @@
+"""Paired strict Collector vectors and a single, real HTTP handoff."""
+
+import hashlib
+import json
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
+import time
+
+import pytest
+import test_foundation_roundtrip
+import test_native_state
+
+from tidewall_collector import native_contract as wire
+from tidewall_collector.tidewall_backend import _post, BackendError
+
+fleet = test_foundation_roundtrip.fleet
+installed = test_foundation_roundtrip.installed
+native = test_native_state.native
+FILES = Path(__file__).parent / "fixtures"
+
+
+def test_paired_contract_and_all_client_vectors():
+    for name, expected in [
+        (
+            "native_prompt_v1.json",
+            "9c671d0c3d1ad1c470f465df288790b22ddb84753fe6ebc126756b99f86aad35",
+        ),
+        (
+            "native_prompt_v1_vectors.json",
+            "668627721b6588152b01564f38e074c6565a6f4e6e8e7792324ac974bed4a8e5",
+        ),
+    ]:
+        assert hashlib.sha256((FILES / name).read_bytes()).hexdigest() == expected
+    for case in json.loads((FILES / name).read_bytes()):
+        if case["type"] in {
+            "NativePolicySettings",
+            "NativeConfigAck",
+            "NativeGrantRequest",
+        }:
+            continue  # Administrator-side types are outside the endpoint.
+        raw = bytes.fromhex(case["hex"])
+        if case["valid"]:
+            wire.parse(case["type"], raw)
+        else:
+            with pytest.raises(ValueError):
+                wire.parse(case["type"], raw)
+
+
+@pytest.fixture
+def receiver():
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            data = self.rfile.read(int(self.headers["Content-Length"]))
+            self.server.seen.append((self.path, dict(self.headers), data))
+            body = self.server.reply(data)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                self.wfile.write(
+                    f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+                )
+            except OSError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.seen = []
+        server.reply = lambda data: b"{}"
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield server
+        finally:
+            server.shutdown()
+            worker.join()
+
+
+def test_native_transport_original_deadline_and_identity_body(receiver, monkeypatch):
+    import subprocess
+
+    spawn = subprocess.Popen
+    workers = []
+
+    def inspect_worker(argv, **kwargs):
+        assert kwargs["env"] == {}
+        assert all(
+            "at_fixture" not in arg and "a" * 43 not in arg and "雪" not in arg
+            for arg in argv
+        )
+        workers.append(1)
+        return spawn(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", inspect_worker)
+    origin = f"http://127.0.0.1:{receiver.server_port}"
+    path = "/v1/native-prompt/decisions"
+
+    def post(body, budget):
+        return _post(
+            origin,
+            path,
+            "at_fixture",
+            body,
+            8192,
+            capability="a" * 43,
+            deadline=time.monotonic() + budget,
+        )
+
+    assert post('{"prompt":"雪"}'.encode(), 1) == (200, b"{}")
+    _, headers, body = receiver.seen[-1]
+    assert headers["X-Tidewall-Inline-Capability"] == "a" * 43
+    assert headers["Authorization"] == "Bearer at_fixture"
+    assert body == '{"prompt":"雪"}'.encode()
+    receiver.reply = lambda data: b"x" * 8193
+    assert post(b"{}", 1) == (200, b"")
+    receiver.reply = lambda data: (time.sleep(0.7), b"{}")[1]
+    started = time.monotonic()
+    with pytest.raises(BackendError, match="timeout"):
+        post(b"{}", 0.22)
+    assert time.monotonic() - started < 0.6
+    assert len(receiver.seen) == len(workers) == 3
+
+
+def _installed_call(cli, state, work, command, *args, streams=(), data=b""):
+    import contextlib
+    import os
+    import subprocess
+
+    from test_foundation_roundtrip import env
+
+    argv = [
+        str(cli),
+        command,
+        "--state-root",
+        str(state),
+        "--session-config",
+        str(state / "native-session.json"),
+        "--fixture-loopback-http",
+        *args,
+    ]
+    with contextlib.ExitStack() as stack:
+        fds = []
+        for option, content in streams:
+            r, w = os.pipe()
+            stack.callback(os.close, r)
+            with os.fdopen(w, "wb") as output:
+                output.write(content)
+            argv += [option, str(r)]
+            fds.append(r)
+        return subprocess.run(
+            argv,
+            pass_fds=fds,
+            input=data,
+            capture_output=True,
+            cwd=work,
+            env=env(work),
+            timeout=4,
+        )
+
+
+def test_installed_metadata_bootstrap_rotation_and_later_observed_report(
+    installed, tmp_path, receiver
+):
+    from test_backend import Receiver, REG
+    from test_native_state import grant
+    from test_native_hook import payload, reply
+    from tidewall_collector.tidewall_backend import TidewallBackend
+    from uuid import uuid4
+
+    root = tmp_path / "A"
+    work = tmp_path / "controlled"
+    work.mkdir(mode=0o700)
+    client = TidewallBackend(root, fixture_loopback=True)
+    client._post = Receiver()
+    owner = client.enrol(f"http://127.0.0.1:{receiver.server_port}", REG, root)
+    client.refresh(owner)
+
+    def call(command, *args, **kwargs):
+        result = _installed_call(installed, root, work, command, *args, **kwargs)
+        assert (
+            b"synthetic-session" not in result.stderr
+            and b"g" * 43 not in result.stdout + result.stderr
+        )
+        return result
+
+    def prepare(g=None, local=False):
+        streams = [("--session-id-fd", b"synthetic-session")]
+        if g:
+            streams.append(("--grant-fd", wire.encode(g)))
+        args = ["--cwd", str(work), "--agent-version", "2.1.330"]
+        if local:
+            args.append("--capture")
+        return call("prepare-native-session", *args, streams=streams)
+
+    token = json.loads(prepare().stdout)["session_token"]
+    private = "  synthetic metadata-only sentinel 雪"
+    raw = payload(work, private)
+    no_grant = call("claude-hook", data=raw)
+    assert no_grant.returncode == 0 and no_grant.stdout == b"" and receiver.seen == []
+    g = grant(owner, token, capture=False)
+    assert prepare(g).returncode == 0
+    chosen = str(uuid4())
+
+    def decide(data):
+        body = json.loads(data)
+        result = reply(body, g)
+        result["session_id"] = chosen
+        if body["input_state"] == "capture_disabled":
+            result.update(
+                evaluated_action="allow",
+                returned_action="allow",
+                reason="capture_disabled",
+            )
+            result["assessment"]["reason"] = "capture_disabled"
+        return wire.encode(result)
+
+    receiver.reply = decide
+    allowed = call("claude-hook", data=raw)
+    assert allowed.returncode == 0 and allowed.stdout == allowed.stderr == b""
+    assert (
+        json.loads(receiver.seen[-1][2])["input_state"] == "capture_disabled"
+        and private.encode() not in receiver.seen[-1][2]
+    )
+    first = g
+    g = dict(
+        grant(owner, token),
+        grant_generation=first["grant_generation"] + 1,
+        session_id=chosen,
+        capability="h" * 43,
+    )
+    assert prepare(dict(g, session_id=str(uuid4())), True).returncode != 0
+    assert prepare(g, True).returncode == 0
+    assert prepare(first, True).returncode != 0
+    blocked = call("claude-hook", data=raw)
+    assert (
+        blocked.returncode == 0
+        and blocked.stderr == b""
+        and json.loads(blocked.stdout)
+        == {"decision": "block", "reason": "Blocked by Tidewall policy"}
+    )
+    assert json.loads(receiver.seen[-1][2])["prompt"] == private
+    assert [p for p, _, _ in receiver.seen] == ["/v1/native-prompt/decisions"] * 2
+    for f in root.rglob("*"):
+        if f.is_file():
+            content = f.read_bytes()
+            assert (
+                private.encode() not in content and b"synthetic-session" not in content
+            )
+            if f.name != "native-session.json":
+                assert b"h" * 43 not in content
+    status = json.loads(call("report-native", "--list").stdout)
+    row = status["rows"][-1]
+    assert row["reports"] == [] and row["outcome"] == "response_prepared"
+    observed = {k: row[k] for k in ("decision_id", "request_id", "occurrence_id")}
+    observed.update(
+        stage="stdout_flushed",
+        evidence_source="controlled_observer",
+        report_id=str(uuid4()),
+    )
+    receiver.reply = lambda data: wire.encode(
+        dict(version=1, report_id=observed["report_id"], decision_id=row["decision_id"])
+    )
+    for count in (1, 0):
+        result = call(
+            "report-native", streams=[("--evidence-fd", wire.encode(observed))]
+        )
+        assert result.returncode == 0 and json.loads(result.stdout) == {
+            "acknowledged": count
+        }
+    assert [p for p, _, _ in receiver.seen] == ["/v1/native-prompt/decisions"] * 2 + [
+        "/v1/native-prompt/deliveries"
+    ]
+    assert json.loads(receiver.seen[-1][2]) == observed
+    assert b"returned_action" not in (root / "native-journal.json").read_bytes()
+
+
+def test_installed_stalls_kill_busy_and_broken_pipe(installed, tmp_path, receiver):
+    import fcntl
+    import subprocess
+    from test_backend import REG, Receiver
+    from test_foundation_roundtrip import env
+    from test_native_state import grant
+    from test_native_hook import payload, reply
+    from tidewall_collector.native_state import NativeState
+    from tidewall_collector.tidewall_backend import TidewallBackend
+
+    root = tmp_path / "A"
+    work = tmp_path / "work"
+    work.mkdir(mode=0o700)
+    client = TidewallBackend(root, fixture_loopback=True)
+    client._post = Receiver()
+    owner = client.enrol(f"http://127.0.0.1:{receiver.server_port}", REG, root)
+    client.refresh(owner)
+    native = NativeState(client, root / "native-session.json")
+    token = native.prepare("synthetic-session", work, "2.1.330", False, None)
+    g = grant(owner, token)
+    native.prepare("synthetic-session", work, "2.1.330", True, g)
+    data = payload(work, "synthetic")
+    argv = [
+        str(installed),
+        "claude-hook",
+        "--state-root",
+        str(root),
+        "--session-config",
+        str(native.path),
+        "--fixture-loopback-http",
+    ]
+
+    def process():
+        return subprocess.Popen(
+            argv,
+            cwd=work,
+            env=env(work),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    # Deliberately never close stdin while waiting for the callback.
+    with process() as child:
+        child.stdin.write(data[:3])
+        child.stdin.flush()
+        start = time.monotonic()
+        assert child.wait(timeout=2.4) == 0 and time.monotonic() - start < 2.25
+        assert child.stdout.read() == b"" and b"timeout" in child.stderr.read()
+    assert not receiver.seen
+    with (root / "credential.lock").open("r+b") as lock, process() as child:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        stdout, stderr = child.communicate(data, timeout=2)
+        assert child.returncode == 0 and not stdout and b"busy" in stderr
+    assert not receiver.seen
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed(body):
+        entered.set()
+        release.wait(2)
+        return wire.encode(reply(json.loads(body), g))
+
+    receiver.reply = delayed
+    with process() as child:
+        child.stdin.write(data)
+        child.stdin.close()
+        assert entered.wait(2)
+        child.kill()
+        child.wait(timeout=1)
+        release.set()
+        assert child.stdout.read() == b""
+    with native.open(owner) as session:
+        assert session.records["rows"][-1]["outcome"] == "reserved_unknown"
+    receiver.reply = lambda body: wire.encode(reply(json.loads(body), g))
+    with process() as child:
+        child.stdout.close()
+        child.stdin.write(data)
+        child.stdin.close()
+        assert (
+            child.wait(timeout=2.3) == 0 and child.stderr.read() == b"stdout_failed\n"
+        )
+    with native.open(owner) as session:
+        assert session.records["rows"][-1]["outcome"] == "response_prepared"
+        assert not session.pending_reports()
+
+
+def test_wheel_native_import_closure(installed, tmp_path):
+    """Exercise wheel imports with an empty home and a read-only import audit."""
+    import subprocess
+    from zipfile import ZipFile
+    from test_foundation_roundtrip import env
+
+    runtime = installed.parent.parent
+    (wheel,) = runtime.parent.glob("*.whl")
+    with ZipFile(wheel) as z:
+        names = set(z.namelist())
+        vendor = {
+            name for name in names if name.startswith(("openaidr/", "openaidr_common/"))
+        }
+        assert vendor == {
+            "openaidr/__init__.py",
+            "openaidr/core/__init__.py",
+            "openaidr/sensor/__init__.py",
+            "openaidr_common/__init__.py",
+            "openaidr/core/event.py",
+            "openaidr/core/files.py",
+            "openaidr/core/hook_protocol.py",
+            "openaidr/core/toolmap.py",
+            "openaidr/sensor/collectors.py",
+            "openaidr/sensor/spool.py",
+            "openaidr_common/event.py",
+            "openaidr/guardrail/__init__.py",
+            "openaidr/guardrail/hooks.py",
+        }
+        assert not any(
+            "Requires-Dist:" in z.read(n).decode()
+            for n in names
+            if n.endswith("/METADATA")
+        )
+        for name, digest in (
+            (
+                "__init__.py",
+                "1ddc371d85568838c47f0014f935138d44469158108c1b1d41f2f5762a3e0a83",
+            ),
+            (
+                "hooks.py",
+                "77aaaba0045b1d605bbb8e050eb308ed1dd2796a90af8b3d7d7a6616d3e86dbb",
+            ),
+        ):
+            assert (
+                hashlib.sha256(z.read("openaidr/guardrail/" + name)).hexdigest()
+                == digest
+            )
+    (purelib,) = (runtime / "lib").glob("python*/site-packages")
+    script = """
+import os,sys,threading
+purelib=sys.argv[1]
+sys.path.insert(0,purelib)
+def audit(event,args):
+    if event.startswith(("socket.","subprocess.","os.exec","os.spawn","os.posix_spawn")):
+        raise AssertionError(event)
+    if event in ("open","os.listdir","os.scandir") and isinstance(args[0],(str,bytes)):
+        p=os.path.realpath(os.fsdecode(args[0]))
+        assert any(p==r or p.startswith(r+os.sep) for r in (os.path.realpath(purelib),os.path.realpath(sys.base_prefix))), (event,p)
+        if event=="open":
+            assert not args[2] & (os.O_WRONLY|os.O_RDWR|os.O_CREAT)
+sys.addaudithook(audit)
+from tidewall_collector import native_hook,cli
+from openaidr.guardrail.hooks import native_response
+assert native_response("claude-code","UserPromptSubmit","deny","Blocked by Tidewall policy",{})[1]["decision"]=="block"
+for name,module in sys.modules.copy().items():
+    if name.split(".")[0] not in sys.stdlib_module_names:
+        assert name.split(".")[0] in {"openaidr","openaidr_common","tidewall_collector","__main__"},name
+    if name.startswith(("openaidr","tidewall_collector")) and getattr(module,"__file__",None):
+        assert module.__file__.startswith(purelib+os.sep)
+assert len(threading.enumerate())==1
+print(" ".join(sorted(n for n in sys.modules if n.startswith(("openaidr","tidewall_collector")))))
+"""
+    result = subprocess.run(
+        [runtime / "bin/python", "-I", "-B", "-S", "-c", script, str(purelib)],
+        cwd=tmp_path,
+        env=env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "openaidr.guardrail.hooks" in result.stdout
+    assert not list(tmp_path.iterdir())
+    print(
+        "wheel",
+        wheel.name,
+        hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "modules",
+        result.stdout.strip(),
+    )
+
+
+def test_observe_native_checks_owner_and_scoped_ack_before_selecting_session(
+    tmp_path, receiver
+):
+    import time
+    from test_backend import REG, Receiver
+    from test_native_state import grant
+    from tidewall_collector.native_state import NativeState
+    from tidewall_collector.tidewall_backend import TidewallBackend
+    from uuid import uuid4
+
+    root = tmp_path / "A"
+    back = TidewallBackend(root, fixture_loopback=True)
+    real = back._post
+    back._post = Receiver()
+    owner = back.enrol(f"http://127.0.0.1:{receiver.server_port}", REG, root)
+    back.refresh(owner)
+    back._post = real
+    native = NativeState(back, root / "native-session.json")
+    token = native.prepare("scope", tmp_path, "2.1.330", False, None)
+    g = grant(owner, token, capture=False)
+    native.prepare("scope", tmp_path, "2.1.330", False, g)
+    with native.open(owner) as session:
+        auth = session.authority()
+    obs = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        agent="claude-code",
+        agent_version="2.1.330",
+        native_profile=wire.PROFILE,
+        session_token=token,
+    )
+    ack = dict(
+        version=1,
+        occurrence_id=obs["occurrence_id"],
+        event_id=str(uuid4()),
+        session_id=str(uuid4()),
+    )
+    receiver.reply = lambda data: wire.encode(dict(ack, occurrence_id=str(uuid4())))
+    with pytest.raises(BackendError, match="invalid_reply"):
+        back.observe_native(auth, obs, time.monotonic() + 1)
+    receiver.reply = lambda data: wire.encode(ack)
+    assert back.observe_native(auth, obs, time.monotonic() + 1) == ack
+    assert all(
+        path == "/v1/native-prompt/observations" and json.loads(body) == obs
+        for path, _, body in receiver.seen
+    )
+    with native.open(owner) as session:
+        assert session.authority().selected_session == ack["session_id"]
+
+
+@pytest.mark.parametrize("local,remote", [(False, True), (True, False)])
+@pytest.mark.parametrize("kind", ["complete", "unsupported", "input_too_large"])
+def test_public_decision_requires_both_permissions_for_content_states(
+    native, local, remote, kind
+):
+    from test_native_hook import reply
+    from test_native_state import grant
+    from uuid import uuid4
+
+    back, state, owner, token, work = native
+    g = grant(owner, token, capture=remote)
+    state.prepare("synthetic-session", work, "2.1.330", local, g)
+    with state.open(owner) as session:
+        auth = session.authority()
+    sent = []
+
+    def post(origin, path, access, body, limit, **kwargs):
+        request = json.loads(body)
+        sent.append(request["input_state"])
+        return 200, wire.encode(reply(request, g))
+
+    back._post = post
+    meta = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        agent="claude-code",
+        agent_version=wire.VERSION,
+        native_profile=wire.PROFILE,
+        session_token=token,
+    )
+    req = dict(
+        version=1,
+        request_id=str(uuid4()),
+        observation=meta,
+        budget_ms=1000,
+        input_state=kind,
+    )
+    if kind == "complete":
+        req["prompt"] = "synthetic"
+    with pytest.raises(BackendError, match="stale_authority"):
+        back.decide_native(auth, req, time.monotonic() + 1)
+    assert sent == []
+    req.pop("prompt", None)
+    req["input_state"] = "capture_disabled"
+    assert (
+        back.decide_native(auth, req, time.monotonic() + 1)["reason"]
+        == "access_rule_block"
+    )
+    assert sent == ["capture_disabled"]
+
+
+@pytest.mark.parametrize("full_expiry", [False, True])
+def test_installed_same_session_administrative_policy_regrant(fleet, full_expiry):
+    """Reconfigure a live migrated Server, then install its newer scoped grant."""
+    import sqlite3
+    from contextlib import closing
+    from uuid import uuid4
+    from tidewall_collector.tidewall_backend import TidewallBackend
+    from tidewall_collector.native_state import NativeState
+
+    f = fleet
+    device = f.enrol()
+    f.approve(device)
+    root = f.root / "A"
+    backend = TidewallBackend(root, fixture_loopback=True)
+    owner = backend.owner()
+    f.call("refresh", "A")
+    native = NativeState(backend, root / "native-session.json")
+    # The Phase 1 fixture's intentionally bare policy needs an input rule.
+    with closing(sqlite3.connect(f.root / "fixture.db")) as db, db:
+        db.execute(
+            "INSERT INTO rule_sets(id,policy_id,event_type,detectors) VALUES(?,?,?,?)",
+            (
+                str(uuid4()),
+                "fixture-policy",
+                "input",
+                json.dumps({"malicious_prompt": {"action": "block"}}),
+            ),
+        )
+    endpoint = "/v1/policies/fixture-policy/native-prompt"
+
+    def configure(threshold):
+        status, config = f.request(
+            "PUT", endpoint, f.admin, dict(enabled=True, threshold=threshold)
+        )
+        assert status == 200
+        return config["generation"]
+
+    def prepare(g=None, *, capture=False, new_session=False, success=True):
+        secrets = [("--session-id-fd", "synthetic-regrant")]
+        if g:
+            secrets.append(("--grant-fd", json.dumps(g)))
+        return f.call(
+            "prepare-native-session",
+            "A",
+            "--session-config",
+            str(native.path),
+            "--cwd",
+            str(f.root),
+            "--agent-version",
+            wire.VERSION,
+            *(["--capture"] if capture else []),
+            *(["--new-session"] if new_session else []),
+            secrets=secrets,
+            success=success,
+        )
+
+    token = json.loads(prepare().stdout)["session_token"]
+
+    def issue(*, ttl_seconds=300, **extra):
+        status, g = f.request(
+            "POST",
+            "/v1/native-prompt/grants",
+            f.admin,
+            dict(
+                device_id=device["device_id"],
+                session_token=token,
+                native_profile=wire.PROFILE,
+                ttl_seconds=ttl_seconds,
+                **extra,
+            ),
+        )
+        assert status == 201
+        return g
+
+    initial_generation = configure(0.5)
+    metadata_grant = issue()
+    prepare(metadata_grant)
+    observation = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        agent="claude-code",
+        agent_version=wire.VERSION,
+        native_profile=wire.PROFILE,
+        session_token=token,
+    )
+
+    def observe():
+        with native.open(owner) as session:
+            auth = session.authority()
+        return backend.observe_native(auth, observation, time.monotonic() + 1.8)
+
+    selected = observe()["session_id"]
+    first = issue(
+        capture_allowed=True, session_id=selected, ttl_seconds=3 if full_expiry else 300
+    )
+    prepare(first, capture=True)
+    if full_expiry:
+        import subprocess
+        from datetime import datetime
+        from test_foundation_roundtrip import SERVER
+
+        def hook():
+            event = dict(
+                hook_event_name="UserPromptSubmit",
+                session_id="synthetic-regrant",
+                cwd=str(f.root),
+                prompt="synthetic",
+            )
+            r = _installed_call(
+                f.cli, root, f.root, "claude-hook", data=wire.encode(event)
+            )
+            assert r.returncode == 0 and not r.stderr
+
+        hook()
+        with native.open(owner) as session:
+            prior_request = session.records["rows"][-1]["request_id"]
+        assert prepare(new_session=True, success=False).returncode != 0
+        # Let the real short-lived capture grant expire locally. Use the Server's
+        # retention clock to advance the independent 30-day purge horizon.
+        expires = datetime.fromisoformat(first["expires_at"]).timestamp()
+        time.sleep(max(0.0, expires - time.time()))
+        subprocess.run(
+            [
+                Path(SERVER) / ".venv/bin/python",
+                "-c",
+                "from datetime import UTC, datetime, timedelta; import sys; "
+                "from app.db.engine import get_engine, get_session_factory; "
+                "from app.services.collection_retention import purge_collection; "
+                "s=get_session_factory(get_engine('sqlite:///'+sys.argv[1]))(); "
+                "purge_collection(s, datetime.now(UTC)+timedelta(days=31)); s.close()",
+                str(f.root / "fixture.db"),
+            ],
+            cwd=SERVER,
+            check=True,
+            timeout=15,
+        )
+        assert f.sql("SELECT session_id FROM agent_sessions") == []
+        assert f.sql("SELECT grant_id FROM native_prompt_grants") == []
+        fresh = issue()
+        assert (
+            fresh["grant_generation"] == 1
+            and prepare(fresh, success=False).returncode != 0
+        )
+        assert json.loads(prepare(new_session=True).stdout)["session_token"] == token
+        with native.open(owner) as session:
+            assert session.config["grant"] is None and not session.config["capture"]
+            assert (
+                "selected_session" not in session.records
+                and not session.records["rows"]
+            )
+            assert session.records["lost"] >= 1 and session.records["discarded"] >= 1
+        assert prior_request.encode() not in native.journal.read_bytes()
+        prepare(fresh)
+        hook()
+        with native.open(owner) as session:
+            new_session = session.records["selected_session"]
+            assert new_session != selected
+        assert f.sql("SELECT input_state FROM native_prompt_decisions") == [
+            ("capture_disabled",)
+        ]
+        capture_grant = issue(capture_allowed=True, session_id=new_session)
+        prepare(capture_grant, capture=True)
+        hook()
+        assert sorted(f.sql("SELECT input_state FROM native_prompt_decisions")) == [
+            ("capture_disabled",),
+            ("complete",),
+        ]
+        return
+
+    second_generation = configure(0.75)
+    assert second_generation > initial_generation
+    with pytest.raises(BackendError, match="grant_revoked"):
+        observe()
+    new = issue(capture_allowed=True, session_id=selected)
+    assert (
+        new["grant_generation"] > first["grant_generation"]
+        and new["policy_generation"] == second_generation
+    )
+    prepare(new)
+    with native.open(owner) as session:
+        assert not session.authority().capture
+    assert observe()["session_id"] == selected
+    assert (
+        prepare(first, capture=True, success=False).stderr.strip() == "grant_mismatch"
+    )
+    prepare(new, capture=True)
+    with native.open(owner) as session:
+        assert (
+            session.authority().capture
+            and session.authority().grant["grant_id"] == new["grant_id"]
+        )
+
+
+def test_native_transport_deadline_stops_at_access_expiry(native, monkeypatch):
+    from test_native_state import grant
+    from uuid import uuid4
+
+    back, state, owner, token, work = native
+    g = grant(owner, token, capture=False)
+    state.prepare("synthetic-session", work, "2.1.330", False, g)
+    expires = int(time.time()) + 5
+    with back._locked() as locked:
+        data = locked.read()
+        data["access_expires_at"] = expires
+        locked.write(data)
+    with state.open(owner) as session:
+        auth = session.authority()
+    observation = dict(
+        version=1,
+        occurrence_id=str(uuid4()),
+        session_token=token,
+        agent="claude-code",
+        native_profile=wire.PROFILE,
+        agent_version=wire.VERSION,
+    )
+    seen = []
+
+    def post(*args, deadline, **kwargs):
+        seen.append(deadline)
+        return 200, wire.encode(
+            dict(
+                version=1,
+                occurrence_id=observation["occurrence_id"],
+                event_id=str(uuid4()),
+                session_id=str(uuid4()),
+            )
+        )
+
+    monkeypatch.setattr(back, "_post", post)
+    limit = time.monotonic() + expires - time.time()
+    back.observe_native(auth, observation, time.monotonic() + 20)
+    assert len(seen) == 1 and abs(seen[0] - limit) < 0.01

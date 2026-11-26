@@ -15,6 +15,8 @@ VENDOR_FILES = {
     "src/openaidr/core/files.py",
     "src/openaidr/core/hook_protocol.py",
     "src/openaidr/core/toolmap.py",
+    "src/openaidr/guardrail/__init__.py",
+    "src/openaidr/guardrail/hooks.py",
     "src/openaidr/sensor/__init__.py",
     "src/openaidr/sensor/collectors.py",
     "src/openaidr/sensor/spool.py",

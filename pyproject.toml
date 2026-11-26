@@ -24,6 +24,8 @@ py-modules = [
     "openaidr.core.files",
     "openaidr.core.hook_protocol",
     "openaidr.core.toolmap",
+    "openaidr.guardrail.__init__",
+    "openaidr.guardrail.hooks",
     "openaidr.sensor.collectors",
     "openaidr.sensor.spool",
     "openaidr_common.event",
@@ -34,6 +36,7 @@ include-package-data = false
 tidewall_collector = "src/tidewall_collector"
 openaidr = "vendor/openaidr/src/openaidr"
 "openaidr.core" = "vendor/openaidr/src/openaidr/core"
+"openaidr.guardrail" = "vendor/openaidr/src/openaidr/guardrail"
 "openaidr.sensor" = "vendor/openaidr/src/openaidr/sensor"
 openaidr_common = "vendor/openaidr/packages/common/src/openaidr_common"
 
