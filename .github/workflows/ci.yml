@@ -177,11 +177,12 @@ jobs:
                   passed = False
                   continue
 
-              copyfile(report, junit / report.name)
               print(f"{name}: {counts}")
               if counts["tests"] <= 0 or counts["tests"] != len(suite.findall("testcase")):
                   print(f"{name}: missing or inconsistent test cases")
                   passed = False
+              else:
+                  copyfile(report, junit / report.name)
               for count, tag in (("skipped", "skipped"), ("failures", "failure"), ("errors", "error")):
                   if counts[count] or suite.find(f".//{tag}") is not None:
                       print(f"{name}: JUnit report contains {count}")
