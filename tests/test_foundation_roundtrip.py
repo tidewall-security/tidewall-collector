@@ -36,6 +36,7 @@ def serve_fixture():
     import sys
     from pathlib import Path
     from datetime import datetime
+    from importlib.util import find_spec
     from app.routes import collector_ingest
     from alembic import command
     from alembic.config import Config
@@ -44,7 +45,6 @@ def serve_fixture():
     from app.db.models import Policy, APIKey
     from app.interaction_log import InteractionLog
     from app.main import create_app
-    from app.services.native_prompt_decisions import NativeDecisionService
     from uuid import uuid4
     import uvicorn
 
@@ -75,9 +75,12 @@ def serve_fixture():
     app = create_app()
     app.state.session_factory = sessions
     app.state.interaction_log = InteractionLog(sessions)
-    app.state.native_decisions = NativeDecisionService(
-        sessions, None, process_id=uuid4()
-    )
+    if find_spec("app.services.native_prompt_decisions") is not None:
+        from app.services.native_prompt_decisions import NativeDecisionService
+
+        app.state.native_decisions = NativeDecisionService(
+            sessions, None, process_id=uuid4()
+        )
 
     async def boundary(scope, receive, send):
         path = scope["path"]
